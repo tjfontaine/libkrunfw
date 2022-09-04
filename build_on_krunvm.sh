@@ -11,31 +11,35 @@ fi
 
 SCRIPTPATH=`realpath $0`
 WORKDIR=`dirname $SCRIPTPATH`
-krunvm create fedora --name libkrunfw-builder --cpus 2 --mem 2048 -v $WORKDIR:/work -w /work
 if [ $? != 0 ]; then
 	echo "Error creating lightweight VM"
 	exit -1
 fi
 
-krunvm start libkrunfw-builder /usr/bin/dnf -- install -y make gcc glibc-devel findutils xz patch flex bison diffutils bc perl cpio
-if [ $? != 0 ]; then
-	echo "Error running command on VM"
-	krunvm delete libkrunfw-builder
-	exit -1
-fi
+set -e
 
-krunvm start libkrunfw-builder /usr/bin/make -- -j2
-if [ $? != 0 ]; then
-	echo "Error running command on VM"
-	krunvm delete libkrunfw-builder
-	exit -1
-fi
-
-krunvm delete libkrunfw-builder
-
-if [ ! -e "kernel.c" ]; then
-	echo "There was a problem building the kernel bundle in the VM"
-	exit -1
-fi
-
-exit 0
+case $1 in
+  prep)
+    set +e
+    exists=`krunvm list | grep libkrunfw-builder`
+    if [ $? != 0 ]; then
+      set -e
+      echo "Creating build environment"
+      krunvm create fedora --name libkrunfw-builder --cpus 2 --mem 2048 -v $WORKDIR:/work -w /work
+    fi
+    echo "Installing dependencies"
+    krunvm start libkrunfw-builder /usr/bin/dnf -- install -qy \
+      make gcc glibc-devel findutils xz patch flex bison diffutils bc perl \
+      cpio
+    ;;
+  clean)
+    krunvm delete libkrunfw-builder
+    ;;
+  *)
+    krunvm start libkrunfw-builder /usr/bin/make -- -j2
+    if [ ! -e "kernel.c" ]; then
+      echo "There was a problem building the kernel bundle in the VM"
+      exit -1
+    fi
+    ;;
+esac

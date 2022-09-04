@@ -58,6 +58,7 @@ all: build_on_krunvm $(KRUNFW_BINARY_$(OS))
 build_on_krunvm:
 ifeq ($(OS),Darwin)
 	@echo Building within krunvm
+	@sh $@.sh prep
 	@sh $@.sh
 else
 	@/bin/sh -c true
@@ -103,3 +104,6 @@ install:
 
 clean:
 	rm -fr $(KERNEL_SOURCES) $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE) $(KRUNFW_BINARY_$(OS))
+ifeq ($(OS),Darwin)
+	@sh ./build_on_krunvm.sh clean
+endif
