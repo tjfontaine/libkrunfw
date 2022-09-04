@@ -6,3 +6,4 @@ kernel.c
 vmlinux
 /tarballs
 /linux-*
+libkrunfw.*

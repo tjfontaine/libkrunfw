@@ -38,6 +38,4 @@ if [ ! -e "kernel.c" ]; then
 	exit -1
 fi
 
-gcc -fPIC -shared -o libkrunfw.dylib kernel.c
-
 exit 0

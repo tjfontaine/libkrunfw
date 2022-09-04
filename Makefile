@@ -51,9 +51,17 @@ ifeq ($(SEV),1)
     INITRD_C_BUNDLE = initrd.c
 endif
 
-.PHONY: all install clean
+.PHONY: all install clean build_on_krunvm
 
-all: $(KRUNFW_BINARY_$(OS))
+all: build_on_krunvm $(KRUNFW_BINARY_$(OS))
+
+build_on_krunvm:
+ifeq ($(OS),Darwin)
+	@echo Building within krunvm
+	@sh $@.sh
+else
+	@/bin/sh -c true
+endif
 
 $(KERNEL_TARBALL):
 	@mkdir -p tarballs
