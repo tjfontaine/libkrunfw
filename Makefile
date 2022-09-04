@@ -51,7 +51,7 @@ ifeq ($(SEV),1)
     INITRD_C_BUNDLE = initrd.c
 endif
 
-.PHONY: all install clean clean_build_env build_on_krunvm
+.PHONY: all install clean clean_build_env build_on_krunvm config
 
 all: build_on_krunvm $(KRUNFW_BINARY_$(OS))
 
@@ -62,6 +62,14 @@ ifeq ($(OS),Darwin)
 	@sh $@.sh
 else
 	@/bin/sh -c true
+endif
+
+config:
+ifeq ($(OS),Darwin)
+	@sh build_on_krunvm.sh $@
+else
+	cd $(KERNEL_SOURCES) ; $(MAKE) menuconfig ; cd ..
+	cp $(KERNEL_SOURCES)/.config config-libkrunfw$(VARIANT)_$(ARCH)
 endif
 
 $(KERNEL_TARBALL):

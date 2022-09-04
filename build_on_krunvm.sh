@@ -36,6 +36,10 @@ case $1 in
       make gcc glibc-devel findutils xz patch flex bison diffutils bc perl \
       cpio
     ;;
+  config)
+    krunvm start ${BNAME} /usr/bin/dnf -- install -qy ncurses-devel
+    krunvm start ${BNAME} /usr/bin/make -- config
+    ;;
   clean)
     krunvm delete ${BNAME}
     ;;
