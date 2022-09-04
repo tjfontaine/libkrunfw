@@ -51,7 +51,7 @@ ifeq ($(SEV),1)
     INITRD_C_BUNDLE = initrd.c
 endif
 
-.PHONY: all install clean build_on_krunvm
+.PHONY: all install clean clean_build_env build_on_krunvm
 
 all: build_on_krunvm $(KRUNFW_BINARY_$(OS))
 
@@ -102,8 +102,12 @@ install:
 	install -m 755 $(KRUNFW_BINARY_$(OS)) $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/
 	cd $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/ ; ln -sf $(KRUNFW_BINARY_$(OS)) $(KRUNFW_SONAME_$(OS)) ; ln -sf $(KRUNFW_SONAME_$(OS)) $(KRUNFW_BASE_$(OS))
 
-clean:
+clean: clean_build_env
 	rm -fr $(KERNEL_SOURCES) $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE) $(KRUNFW_BINARY_$(OS))
+
+clean_build_env:
 ifeq ($(OS),Darwin)
 	@sh ./build_on_krunvm.sh clean
+else
+	@/bin/sh -c true
 endif
