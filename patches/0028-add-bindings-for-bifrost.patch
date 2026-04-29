@@ -1,0 +1,27 @@
+From c19a7924c88597afaf413f8482436f560e251eb3 Mon Sep 17 00:00:00 2001
+From: Antigravity <antigravity@gemini.com>
+Date: Mon, 27 Apr 2026 00:00:00 +0000
+Subject: [PATCH] rust: bindings: add virtio and kprobes for bifrost
+
+---
+ rust/bindings/bindings_helper.h | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index b0ea1fb8163f..809c95b60cf5 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -22,6 +22,11 @@
+ #include <linux/slab.h>
+ #include <linux/wait.h>
+ #include <linux/workqueue.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/kprobes.h>
++#include <linux/bpf.h>
++#include <linux/filter.h>
+ 
+ /* `bindgen` gets confused at certain things. */
+ const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
+-- 
+2.39.2

@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Bifrost <bifrost@local>
+Date: Tue, 28 Apr 2026 15:30:00 +0000
+Subject: [PATCH] bifrost: kernel-side bpf_ringbuf consumer
+
+Adds `bifrost_ringbuf_consume(map, cb, ctx)` — a kernel-mode
+consumer for kernel-producer BPF_MAP_TYPE_RINGBUF maps. Walks
+records between consumer_pos and producer_pos, fires the supplied
+callback for each valid sample, and advances consumer_pos.
+
+The standard kernel ringbuf is designed for userspace consumers
+(userspace mmaps the producer page + data area, walks records
+itself). The bifrost guest module needs to consume records from
+kernel context — its worker thread drains the ringbuf periodically
+and ferries records to the host over virtio (VQ_EVENT op=7
+RINGBUF_RECORDS).
+
+Why this shim instead of forking the standard helpers: lets bifrost
+use real BPF_MAP_TYPE_RINGBUF maps + standard helpers
+(bpf_ringbuf_reserve/submit, IDs 131/132 in the kernel's helper
+table) instead of custom host-mapped-page implementations. With
+real maps, the kernel verifier accepts the program as-is, and the
+custom helpers `bifrost_ringbuf_reserve` / `bifrost_ringbuf_submit`
+go away. Net deletes ~150 lines of bifrost-specific kernel surface.
+
+The function takes the spinlock-equivalent busy bit on the ringbuf
+to avoid concurrent kernel consumers; producer-side
+bpf_ringbuf_reserve/submit use rb->spinlock and are unaffected.
+
+Also extends rust/bindings/bindings_helper.h with the matching
+extern declaration so bindgen surfaces it to bifrost_guest.
+---
+ kernel/bpf/ringbuf.c            | 79 +++++++++++++++++++++++++++++++++
+ rust/bindings/bindings_helper.h | 11 +++++
+ 2 files changed, 90 insertions(+)
+
+diff --git a/kernel/bpf/ringbuf.c b/kernel/bpf/ringbuf.c
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@ -806,3 +806,82 @@ const struct bpf_func_proto bpf_user_ringbuf_drain_proto = {
+ 	.arg4_type	= ARG_ANYTHING,
+ };
++
++/*
++ * Bifrost kernel-side consumer for kernel-producer bpf_ringbuf
++ * maps. Walks records between consumer_pos and producer_pos,
++ * fires the supplied callback for each valid sample, advances
++ * consumer_pos.
++ *
++ * Returns the number of samples consumed, or -EINVAL/-EBUSY.
++ * The callback returns 0 to continue, nonzero to stop early.
++ */
++int bifrost_ringbuf_consume(struct bpf_map *map,
++			    int (*cb)(void *data, u32 len, void *ctx),
++			    void *ctx)
++{
++	struct bpf_ringbuf *rb;
++	unsigned long cons_pos, prod_pos;
++	int n_consumed = 0;
++	int busy = 0;
++
++	if (!map || map->map_type != BPF_MAP_TYPE_RINGBUF)
++		return -EINVAL;
++
++	rb = container_of(map, struct bpf_ringbuf_map, map)->rb;
++	if (!rb)
++		return -EINVAL;
++
++	if (!atomic_try_cmpxchg(&rb->busy, &busy, 1))
++		return -EBUSY;
++
++	cons_pos = smp_load_acquire(&rb->consumer_pos);
++	prod_pos = smp_load_acquire(&rb->producer_pos);
++
++	while (cons_pos < prod_pos) {
++		u32 *hdr;
++		u32 hdr_len, sample_len, total_len;
++
++		hdr = (u32 *)((uintptr_t)rb->data + ((uintptr_t)cons_pos & rb->mask));
++		hdr_len = smp_load_acquire(hdr);
++
++		if (hdr_len & BPF_RINGBUF_BUSY_BIT)
++			break;
++
++		sample_len = hdr_len & ~(BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT);
++		total_len = round_up(sample_len + BPF_RINGBUF_HDR_SZ, 8);
++
++		if (total_len > prod_pos - cons_pos)
++			break;
++
++		if (!(hdr_len & BPF_RINGBUF_DISCARD_BIT)) {
++			void *sample = (void *)((uintptr_t)rb->data +
++				((uintptr_t)(cons_pos + BPF_RINGBUF_HDR_SZ) & rb->mask));
++			int rc = cb(sample, sample_len, ctx);
++			if (rc)
++				break;
++		}
++
++		cons_pos += total_len;
++		n_consumed++;
++	}
++
++	smp_store_release(&rb->consumer_pos, cons_pos);
++	atomic_set(&rb->busy, 0);
++	return n_consumed;
++}
++EXPORT_SYMBOL_GPL(bifrost_ringbuf_consume);
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -64,6 +64,13 @@ extern int bifrost_map_get_fd(struct bpf_map *map, int flags);
+ /* close_fd from fs/file.c — releases an fd in the current task's
+  * file table. Used to release fds bifrost_map_get_fd allocates
+  * once the verifier has resolved them in the program. */
+ extern int close_fd(unsigned int fd);
++/* Bifrost kernel-mode consumer for kernel-producer bpf_ringbuf
++ * maps (kernel/bpf/ringbuf.c). Used by the guest worker thread
++ * to drain records and ferry them to the host over virtio. */
++extern int bifrost_ringbuf_consume(struct bpf_map *map,
++				   int (*cb)(void *data, unsigned int len,
++					     void *ctx),
++				   void *ctx);
+--
+2.49.0

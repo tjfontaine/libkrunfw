@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Bifrost <bifrost@local>
+Date: Tue, 28 Apr 2026 16:10:00 +0000
+Subject: [PATCH] bifrost: bpf log_attr_valid allows BPF_LOG_KERNEL bit
+
+Widens the `bpf_verifier_log_attr_valid` mask so callers can pass
+`attr.log_level = BPF_LOG_KERNEL` directly to `bpf_check`. Without
+this, the validity check rejects the BPF_LOG_KERNEL bit (it lives
+in `~BPF_LOG_MASK`) and `bpf_vlog_init` returns -EINVAL with no
+verbose output, making kernel-mode verifier callers (like the
+bifrost guest module's bifrost_verify_prog shim from patch 0030)
+silently fail.
+
+The kernel's userspace BPF_PROG_LOAD path doesn't use this bit —
+it sets log->level = BPF_LOG_KERNEL only internally for the
+"kernel-internal verifier invocation" cases (bpf_check_attach_target,
+struct_ops, etc.) by direct field assignment. Allowing the bit to
+flow through bpf_vlog_init lets external callers do the same
+without poking log fields directly.
+
+This is one of three pieces (with 0030 and 0031) staged for routing
+the bifrost guest module's LOAD_PROG path through the standard
+kernel BPF verifier. The remaining work is tracing why
+mark_fastcall_patterns NULL-derefs when called on our prog —
+likely a prog->aux field the userspace bpf_prog_load path
+populates that the guest module doesn't.
+---
+ kernel/bpf/log.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/log.c b/kernel/bpf/log.c
+--- a/kernel/bpf/log.c
++++ b/kernel/bpf/log.c
+@@ -22,7 +22,10 @@ static bool bpf_verifier_log_attr_valid(const struct bpf_verifier_log *log)
+ 	if (log->ubuf && log->level == 0)
+ 		return false;
+-	if (log->level & ~BPF_LOG_MASK)
++	/* Bifrost: allow BPF_LOG_KERNEL to be passed in via attr.log_level
++	 * directly, so kernel-mode callers (bifrost_verify_prog) can route
++	 * verifier output to dmesg without setting up a userspace log buf. */
++	if (log->level & ~(BPF_LOG_MASK | BPF_LOG_KERNEL))
+ 		return false;
+ 	if (log->len_total > UINT_MAX >> 2)
+ 		return false;
+--
+2.49.0

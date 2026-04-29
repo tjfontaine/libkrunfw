@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Bifrost <bifrost@local>
+Date: Tue, 29 Apr 2026 01:00:00 +0000
+Subject: [PATCH] bifrost: per-cpu-aware map-lookup-sum shim
+
+Adds `bifrost_map_lookup_sum_u64` so the bifrost guest module's
+agg-snapshot worker can read PERCPU_ARRAY / PERCPU_HASH maps as a
+single u64 (sum across all per-cpu slots) without re-implementing
+the per-cpu iteration in Rust.
+
+Why this lives in the kernel and not in the guest module: per-cpu
+iteration uses `for_each_possible_cpu` and `per_cpu_ptr`, both
+kernel-internal macros. Easier to expose a single C helper than
+bind those through bindgen.
+
+Falls back to `map_lookup_elem` when the map isn't per-cpu, so the
+same shim works for the legacy ARRAY / HASH path. Returns 0 on
+success, -ENOENT for absent keys, -EINVAL on shape errors.
+
+Pairs with the LDGS lowering switch to PERCPU_ARRAY / PERCPU_HASH
+for unkeyed and keyed aggs respectively — agg fires now atomic-add
+on the local-CPU slot only, with no cross-CPU coherence traffic.
+
+---
+ kernel/bpf/syscall.c              | 49 +++++++++++++++++++++++++++++++++++++++
+ rust/bindings/bindings_helper.h   |  5 ++++
+ 2 files changed, 54 insertions(+)
+
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -6125,6 +6125,55 @@ int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_key)
+ 	return map->ops->map_get_next_key(map, key, next_key);
+ }
+ EXPORT_SYMBOL_GPL(bifrost_map_get_next_key);
++
++/*
++ * Bifrost agg-snapshot reader. For PERCPU_ARRAY / PERCPU_HASH maps,
++ * sum the per-cpu slots into a single u64 (we only support u64
++ * agg values for now). For non-percpu maps, fall back to a single
++ * map_lookup_elem read.
++ *
++ * Returns 0 on success and writes `*out_sum`. -ENOENT if the key is
++ * absent. -EINVAL on shape mismatch.
++ *
++ * Why this lives in a shim and not in the guest module: per-cpu
++ * iteration uses `for_each_possible_cpu` and `per_cpu_ptr`, which
++ * are kernel-internal macros. Easier to expose a single C helper
++ * than recreate them via bindgen.
++ */
++int bifrost_map_lookup_sum_u64(struct bpf_map *map, const void *key, u64 *out_sum)
++{
++	void *val_ptr;
++	int cpu;
++
++	if (!map || !map->ops || !out_sum)
++		return -EINVAL;
++
++	if (map->ops->map_lookup_percpu_elem) {
++		u64 sum = 0;
++		bool any = false;
++		for_each_possible_cpu(cpu) {
++			val_ptr = map->ops->map_lookup_percpu_elem(
++				map, (void *)key, cpu);
++			if (val_ptr) {
++				sum += *(u64 *)val_ptr;
++				any = true;
++			}
++		}
++		if (!any)
++			return -ENOENT;
++		*out_sum = sum;
++		return 0;
++	}
++
++	if (!map->ops->map_lookup_elem)
++		return -EINVAL;
++	val_ptr = map->ops->map_lookup_elem(map, (void *)key);
++	if (!val_ptr)
++		return -ENOENT;
++	*out_sum = *(u64 *)val_ptr;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(bifrost_map_lookup_sum_u64);
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -49,6 +49,11 @@ extern void *bifrost_map_lookup_elem(struct bpf_map *map, const void *key);
+ extern int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_key);
++/* Bifrost per-cpu-aware u64 reader for the snapshot worker. For
++ * PERCPU_ARRAY / PERCPU_HASH maps sums all per-cpu slots into a
++ * single u64; for non-percpu maps falls back to a single
++ * map_lookup_elem read. */
++extern int bifrost_map_lookup_sum_u64(struct bpf_map *map, const void *key, unsigned long long *out_sum);
+--
+2.49.0

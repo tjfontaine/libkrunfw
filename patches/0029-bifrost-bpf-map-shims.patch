@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Bifrost <bifrost@local>
+Date: Mon, 28 Apr 2026 04:00:00 +0000
+Subject: [PATCH] bifrost: bpf map allocation + readback shims
+
+Adds four EXPORT_SYMBOL_GPL kernel shims that let the bifrost guest
+driver use real kernel BPF maps (PERCPU_ARRAY / ARRAY / HASH /
+PERCPU_HASH) for aggregations without going through the BPF_MAP_CREATE
+syscall path:
+
+- bifrost_alloc_map(map_type, key_size, value_size, max_entries):
+  dispatches to bpf_map_types[type]->map_alloc and finishes the same
+  initialization sequence as bpf_map_create (cookie / refcnt /
+  mutexes), returning a bpf_map* whose .ops are set so JIT'd eBPF
+  can call bpf_map_lookup_elem / bpf_map_update_elem natively.
+- bifrost_free_map(map): per-type ops->map_free.
+- bifrost_map_lookup_elem(map, key) and
+  bifrost_map_get_next_key(map, key, next_key): thin shims used by
+  the guest's snapshot worker to iterate live agg entries from
+  kernel context. The C-level bpf_map_lookup_elem isn't normally
+  EXPORT_SYMBOL'd; this gives OOT modules a stable handle.
+
+These replace the legacy bifrost_agg_inc / bifrost_agg_inc_keyed
+custom helpers that operated on host-mapped page slots. Aggregations
+now live in real kernel BPF maps; the guest periodically pushes
+(map_fd, key, value) tuples to the host via VQ_EVENT op=6.
+
+Also extends rust/bindings/bindings_helper.h with the matching
+extern declarations so bindgen surfaces them to bifrost_guest.
+---
+ kernel/bpf/syscall.c            | 88 +++++++++++++++++++++++++++++++++
+ rust/bindings/bindings_helper.h | 11 +++++
+ 2 files changed, 99 insertions(+)
+
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -6037,3 +6037,91 @@ static int __init bpf_syscall_sysctl_init(void)
+ late_initcall(bpf_syscall_sysctl_init);
+ #endif /* CONFIG_SYSCTL */
++
++/*
++ * Bifrost map allocation shim. Bypasses the BPF_MAP_CREATE syscall
++ * path (which requires a userspace `union bpf_attr` and capability
++ * checks) and directly invokes the per-type map_alloc op. Returns a
++ * fully-initialized bpf_map* whose `ops` are set so that subsequent
++ * bpf_map_lookup_elem / bpf_map_update_elem from JIT'd eBPF Just Work.
++ *
++ * No security checks: this is for in-kernel use by the bifrost guest
++ * driver, which is itself loaded by privileged init. The intent is to
++ * let bifrost replace its custom bifrost_agg_inc helpers with native
++ * PERCPU_ARRAY / PERCPU_HASH / HASH backed by real kernel maps.
++ */
++struct bpf_map *bifrost_alloc_map(u32 map_type, u32 key_size,
++				  u32 value_size, u32 max_entries)
++{
++	union bpf_attr attr = {};
++	const struct bpf_map_ops *ops;
++	struct bpf_map *map;
++	int err;
++
++	if (map_type >= ARRAY_SIZE(bpf_map_types))
++		return ERR_PTR(-EINVAL);
++	ops = bpf_map_types[map_type];
++	if (!ops || !ops->map_alloc)
++		return ERR_PTR(-EINVAL);
++
++	attr.map_type = map_type;
++	attr.key_size = key_size;
++	attr.value_size = value_size;
++	attr.max_entries = max_entries;
++
++	if (ops->map_alloc_check) {
++		err = ops->map_alloc_check(&attr);
++		if (err)
++			return ERR_PTR(err);
++	}
++	map = ops->map_alloc(&attr);
++	if (IS_ERR(map))
++		return map;
++	map->ops = ops;
++	map->map_type = map_type;
++	atomic64_set(&map->refcnt, 1);
++	atomic64_set(&map->usercnt, 1);
++	mutex_init(&map->freeze_mutex);
++	spin_lock_init(&map->owner_lock);
++	return map;
++}
++EXPORT_SYMBOL_GPL(bifrost_alloc_map);
++
++/*
++ * Bifrost map free counterpart — releases storage allocated by
++ * bifrost_alloc_map. Calls the per-type map_free op.
++ */
++void bifrost_free_map(struct bpf_map *map)
++{
++	if (!map)
++		return;
++	if (map->ops && map->ops->map_free)
++		map->ops->map_free(map);
++}
++EXPORT_SYMBOL_GPL(bifrost_free_map);
++
++/*
++ * Bifrost map lookup shim — calls map.ops->map_lookup_elem so the
++ * bifrost guest driver can read agg values from kernel context (e.g.
++ * a periodic snapshot worker) without re-implementing each map type's
++ * lookup logic.
++ */
++void *bifrost_map_lookup_elem(struct bpf_map *map, const void *key)
++{
++	if (!map || !map->ops || !map->ops->map_lookup_elem)
++		return NULL;
++	return map->ops->map_lookup_elem(map, (void *)key);
++}
++EXPORT_SYMBOL_GPL(bifrost_map_lookup_elem);
++
++/*
++ * Bifrost get_next_key shim — for iterating HASH/PERCPU_HASH entries
++ * during snapshots. Pass `key=NULL` for the first key.
++ */
++int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_key)
++{
++	if (!map || !map->ops || !map->ops->map_get_next_key)
++		return -EINVAL;
++	return map->ops->map_get_next_key(map, key, next_key);
++}
++EXPORT_SYMBOL_GPL(bifrost_map_get_next_key);
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -37,6 +37,17 @@ extern int bifrost_walk_kallsyms(int (*cb)(void *, const char *, unsigned long),
+ /* Bifrost stack walker — wraps stack_trace_save_regs (kernel-internal). */
+ extern unsigned int bifrost_stack_walk(struct pt_regs *regs, unsigned long *store,
+ 				       unsigned int nr, unsigned int skipnr);
++/* Bifrost map allocation shim (kernel/bpf/syscall.c). Returns a real
++ * bpf_map (PERCPU_ARRAY / HASH / PERCPU_HASH / etc.) with .ops set so
++ * subsequent JIT'd eBPF can call bpf_map_lookup_elem / update_elem
++ * natively. Replaces the legacy custom bifrost_agg_inc helper path. */
++extern struct bpf_map *bifrost_alloc_map(unsigned int map_type,
++					 unsigned int key_size,
++					 unsigned int value_size,
++					 unsigned int max_entries);
++extern void bifrost_free_map(struct bpf_map *map);
++/* In-kernel readback shims for the snapshot worker. The standard
++ * `bpf_map_lookup_elem` C function isn't EXPORT_SYMBOL'd. */
++extern void *bifrost_map_lookup_elem(struct bpf_map *map, const void *key);
++extern int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_key);
+
+ /* `bindgen` gets confused at certain things. */
+ const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
+--
+2.49.0

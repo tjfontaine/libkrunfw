@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Bifrost <bifrost@local>
+Date: Tue, 28 Apr 2026 14:00:00 +0000
+Subject: [PATCH] bifrost: verifier + map-fd allocation shims
+
+Adds two EXPORT_SYMBOL_GPL shims that let the bifrost guest module
+route programs through the standard kernel BPF verifier before
+JIT'ing them, plus the supporting fd-allocation helper:
+
+- bifrost_verify_prog(struct bpf_prog **prog): runs the kernel's
+  bpf_check() with attr.log_level=BPF_LOG_KERNEL so the verifier's
+  verbose output lands in dmesg via pr_err. Returns 0 on accept,
+  errno on reject. Caller is responsible for prog setup
+  (bpf_prog_alloc + type/len + insns) and for ensuring any
+  LD_DW_IMM with src_reg=BPF_PSEUDO_MAP_FD carries a real fd
+  resolvable via __bpf_map_get.
+
+- bifrost_map_get_fd(struct bpf_map *map, int flags): wraps
+  bpf_map_new_fd with refcount-bumping (bpf_map_inc_with_uref)
+  so the caller can keep a kernel pointer to the map alive past
+  the fd's close. After the verifier resolves the fd to a map
+  ptr in the program, the fd can be released via close_fd.
+
+Status: shims are present and EXPORT_SYMBOL_GPL'd. The bifrost
+guest module does NOT yet call them — bringing the verifier inline
+hits a separate architecture problem (the custom helpers
+bifrost_ringbuf_reserve/submit at IDs 131/132 aren't in the kernel
+verifier's helper table for BPF_PROG_TYPE_KPROBE). Three paths
+forward:
+
+  (a) Patch kernel/trace/bpf_trace.c kprobe_prog_func_proto to
+      teach the verifier about IDs 131/132 (with bpf_func_proto
+      signature entries).
+  (b) Convert the bifrost ringbuf to use real BPF_MAP_TYPE_RINGBUF
+      maps with standard helpers (bpf_ringbuf_reserve = id 131,
+      bpf_ringbuf_submit = id 132 — different but verifier-known).
+  (c) Skip the verifier for record-emitting programs; only verify
+      agg-only programs that use standard helpers.
+
+Path (b) eliminates the custom helpers entirely and gets
+verifier coverage for free; longest-tail but cleanest.
+
+Also adds an extern decl for `close_fd` (already exported from
+fs/file.c but not pulled in by any header bindgen processes).
+---
+ kernel/bpf/syscall.c            | 60 +++++++++++++++++++++++++++++++++
+ rust/bindings/bindings_helper.h | 13 +++++++
+ 2 files changed, 73 insertions(+)
+
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -6125,3 +6125,63 @@ int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_key)
+ 	return map->ops->map_get_next_key(map, key, next_key);
+ }
+ EXPORT_SYMBOL_GPL(bifrost_map_get_next_key);
++
++/*
++ * Bifrost verifier shim. Runs the standard kernel BPF verifier
++ * against a pre-loaded bpf_prog using `bpf_check`, with output
++ * directed to the kernel log via `BPF_LOG_KERNEL`. Returns 0 on
++ * accept, errno on reject. Verifier verbose log lands in dmesg.
++ */
++int bifrost_verify_prog(struct bpf_prog **prog)
++{
++	union bpf_attr attr = {};
++	bpfptr_t uattr;
++
++	attr.log_level = BPF_LOG_KERNEL;
++	uattr = make_bpfptr((unsigned long)&attr, true);
++
++	return bpf_check(prog, &attr, uattr, 0);
++}
++EXPORT_SYMBOL_GPL(bifrost_verify_prog);
++
++/*
++ * Bifrost map-fd allocation shim. Wraps `bpf_map_new_fd` with a
++ * refcount bump so the caller can hold a kernel pointer to the
++ * map past the fd's close.
++ */
++int bifrost_map_get_fd(struct bpf_map *map, int flags)
++{
++	int ret;
++
++	if (!map)
++		return -EINVAL;
++	bpf_map_inc_with_uref(map);
++	ret = bpf_map_new_fd(map, flags);
++	if (ret < 0)
++		bpf_map_put_with_uref(map);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(bifrost_map_get_fd);
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -49,6 +49,19 @@ extern struct bpf_map *bifrost_alloc_map(unsigned int map_type,
+ extern void *bifrost_map_lookup_elem(struct bpf_map *map, const void *key);
+ extern int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_key);
++/* Bifrost verifier shim — runs the standard kernel BPF verifier
++ * via bpf_check, with verbose output to dmesg via BPF_LOG_KERNEL.
++ * Caller must (a) bpf_prog_alloc + set type/len + copy insns,
++ * (b) for any LD_DW_IMM with src_reg=BPF_PSEUDO_MAP_FD ensure
++ * imm holds a real fd resolvable via __bpf_map_get. */
++extern int bifrost_verify_prog(struct bpf_prog **prog);
++/* Anon-inode-fd allocator wrapping bpf_map_new_fd. */
++extern int bifrost_map_get_fd(struct bpf_map *map, int flags);
++/* close_fd from fs/file.c — releases an fd in the current task's
++ * file table. Used to release fds bifrost_map_get_fd allocates
++ * once the verifier has resolved them in the program. */
++extern int close_fd(unsigned int fd);
+--
+2.49.0

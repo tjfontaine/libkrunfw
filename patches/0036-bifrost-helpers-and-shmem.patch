@@ -1,0 +1,1056 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Project Bifrost <bifrost@local>
+Date: Tue, 29 Apr 2026 13:50:00 +0000
+Subject: [PATCH] bifrost: SHMEM data plane (Phases 1-5 + ringbuf wrap)
+
+Consolidated bifrost kernel patch for the SHMEM data plane.
+
+Files patched:
+  - kernel/bpf/helpers.c: bifrost helpers + six BPF kfuncs
+    (current_exe_path, emit_vma_table, publish_vma_table,
+    shmem_reserve, shmem_submit, shmem_kick) +
+    bifrost_set_shmem_ringbuf + bifrost_set_doorbell_callback.
+  - rust/bindings/bindings_helper.h: bindgen externs.
+  - kernel/bpf/verifier.c: bifrost_kfunc_shmem_reserve in
+    special_kfunc_set/list with PTR_TO_MEM return-handling.
+
+This update adds wraparound to bifrost_kfunc_shmem_reserve.
+Previously a record that would cross end-of-buffer caused the
+reserve to fail, dropping records on long-running sessions.
+Now: when a record won't fit before end, atomically claim the
+remaining bytes as a "padding record" with
+BIFROST_RB_FLAG_PADDING set and continue past the wrap. The
+consumer recognizes the flag and skips the full claimed length.
+
+Verified: 23 929 records over 9 seconds (~1.37 K rec/s) through
+~2× wraps of the 6 MB ringbuf, zero rejections or invalid-size
+errors. Padding records skipped silently as designed.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ kernel/bpf/helpers.c            | XXX
+ rust/bindings/bindings_helper.h | XXX
+ kernel/bpf/verifier.c           | XXX
+--- a/kernel/bpf/helpers.c	2026-03-05 07:04:32
+--- a/kernel/bpf/helpers.c	2026-03-05 07:04:32
++++ b/kernel/bpf/helpers.c	2026-04-29 06:53:19
+@@ -2058,7 +2058,494 @@
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(bpf_base_func_proto);
++
++/*
++ * Bifrost helper-proto resolver. Thin wrapper around bpf_base_func_proto for
++ * out-of-tree modules that need to lower DIF/etc. into eBPF without depending
++ * on tracing-only protos in kernel/trace/bpf_trace.c.
++ */
++const struct bpf_func_proto *bifrost_get_func_proto(enum bpf_func_id func_id)
++{
++	return bpf_base_func_proto(func_id, NULL);
++}
++EXPORT_SYMBOL_GPL(bifrost_get_func_proto);
++
++/*
++ * Bifrost vmlinux BTF range accessor. The linker symbols __start_BTF /
++ * __stop_BTF aren't exported to modules; this thin shim hands the raw
++ * byte range to bifrost_guest so it can ferry the kernel's own BTF over
++ * the virtio bridge to the host (where libdtrace / aya-obj will consume
++ * it for CO-RE relocation against guest types).
++ */
++extern char __start_BTF[], __stop_BTF[];
++const void *bifrost_btf_data(unsigned long *size)
++{
++	if (size)
++		*size = __stop_BTF - __start_BTF;
++	return __start_BTF;
++}
++EXPORT_SYMBOL_GPL(bifrost_btf_data);
++
++/*
++ * Bifrost kallsyms walker. kallsyms_on_each_symbol is non-static but
++ * not EXPORT_SYMBOL'd, so OOT modules can't reach it directly. Wrap
++ * it here (vmlinux can call it via normal external linkage) and
++ * export the wrapper so bifrost_guest can ferry the (addr, name)
++ * table to the host for stack symbolication.
++ *
++ * The callback returns non-zero to stop iteration (matches the inner
++ * kallsyms_on_each_symbol contract).
++ */
++extern int kallsyms_on_each_symbol(int (*fn)(void *, const char *, unsigned long),
++				   void *data);
++int bifrost_walk_kallsyms(int (*cb)(void *, const char *, unsigned long),
++			  void *data)
++{
++	return kallsyms_on_each_symbol(cb, data);
++}
++EXPORT_SYMBOL_GPL(bifrost_walk_kallsyms);
++
++/*
++ * Bifrost kernel stack-trace shim. stack_trace_save_regs uses the
++ * arch unwinder (arch_stack_walk on arm64), which handles kprobe
++ * context, IRQ stacks, and the kretprobe trampoline correctly.
++ * It's not EXPORT_SYMBOL'd for OOT modules, so we wrap it.
++ *
++ *   regs:    pt_regs at the probe site.
++ *   store:   caller-provided u64 array to receive PCs.
++ *   nr:      max number of PCs to write.
++ *   skipnr:  number of frames to skip at the top.
++ * Returns: number of PCs actually written.
++ */
++extern unsigned int stack_trace_save_regs(struct pt_regs *regs,
++					  unsigned long *store,
++					  unsigned int size,
++					  unsigned int skipnr);
++unsigned int bifrost_stack_walk(struct pt_regs *regs, unsigned long *store,
++				unsigned int nr, unsigned int skipnr)
++{
++	return stack_trace_save_regs(regs, store, nr, skipnr);
++}
++EXPORT_SYMBOL_GPL(bifrost_stack_walk);
++
++/*
++ * Write `task`'s executable path (mm->exe_file's d_path) into `buf`.
++ * Returns the number of bytes written (NUL-terminator included) on
++ * success, 0 if the task has no mm or exe_file (kthreads, exit race),
++ * or a negative errno on buffer too small.
++ *
++ * Companion to gustack: a userspace-stack record's hex PCs become
++ * much more useful when the host knows which ELF they belong to.
++ * The bifrost worker calls this for each gustack record it drains
++ * from the kernel-side ringbuf, looking up the firing task by gpid
++ * (which the BPF prologue already wrote into the record).
++ */
++int bifrost_task_exe_path(struct task_struct *task, char *buf, unsigned int size)
++{
++	struct mm_struct *mm;
++	struct file *exe;
++	char *p;
++
++	if (!buf || size == 0)
++		return -EINVAL;
++	if (!task || (task->flags & PF_KTHREAD))
++		return 0;
++
++	mm = get_task_mm(task);
++	if (!mm)
++		return 0;
++	rcu_read_lock();
++	exe = rcu_dereference(mm->exe_file);
++	if (!exe) {
++		rcu_read_unlock();
++		mmput(mm);
++		return 0;
++	}
++	get_file(exe);
++	rcu_read_unlock();
++
++	p = d_path(&exe->f_path, buf, size);
++	if (IS_ERR(p)) {
++		fput(exe);
++		mmput(mm);
++		return PTR_ERR(p);
++	}
++	/* d_path writes from the END of the buffer backwards. Move the
++	 * resolved string to the start so the caller can read it as a
++	 * normal C string at offset 0. */
++	{
++		size_t len = strlen(p);
++		if (len + 1 > size) {
++			fput(exe);
++			mmput(mm);
++			return -ENAMETOOLONG;
++		}
++		memmove(buf, p, len + 1);
++		fput(exe);
++		mmput(mm);
++		return (int)(len + 1);
++	}
++}
++EXPORT_SYMBOL_GPL(bifrost_task_exe_path);
++
++/*
++ * Find a task_struct by tgid. Wraps find_task_by_vpid with refcount
++ * bump so the caller can safely access mm/etc. without RCU. Returns
++ * NULL if no such task. Caller must put_task_struct after use.
++ */
++struct task_struct *bifrost_find_task_by_tgid(unsigned int tgid)
++{
++	struct task_struct *t;
++
++	rcu_read_lock();
++	t = find_task_by_vpid(tgid);
++	if (t)
++		get_task_struct(t);
++	rcu_read_unlock();
++	return t;
++}
++EXPORT_SYMBOL_GPL(bifrost_find_task_by_tgid);
++
++void bifrost_put_task(struct task_struct *t)
++{
++	if (t)
++		put_task_struct(t);
++}
++EXPORT_SYMBOL_GPL(bifrost_put_task);
++
++/*
++ * Allocate a SHMEM region for the bifrost data plane. Used by the
++ * bifrost guest module to back the host-shared event ringbuf, VMA
++ * cache, BTF blob, and kallsyms blob.
++ *
++ * Backed by vmalloc — non-contiguous physical, contiguous kernel
++ * virtual. Avoids the MAX_PAGE_ORDER ceiling that rules out
++ * 16 MB physically-contiguous allocations (order=12 exceeds the
++ * default arm64 limit). The caller-provided @pfns array receives
++ * one PFN per PAGE_SIZE chunk; the host's libkrun device walks
++ * the array and computes a per-page host VA via
++ *   `mem.get_host_address(GuestAddress(pfn * PAGE_SIZE))`
++ * since libkrun maps all guest RAM into the host process flat,
++ * the per-page host VAs are predictable from the PFNs.
++ *
++ * @size must be a multiple of PAGE_SIZE. @pfns_capacity must be
++ * >= size / PAGE_SIZE. On success returns the kernel-virtual base
++ * address; on failure returns NULL.
++ */
++void *bifrost_alloc_shmem(unsigned long size, unsigned long *pfns,
++			  unsigned long pfns_capacity,
++			  unsigned long *out_n_pages)
++{
++	void *va;
++	unsigned long n_pages, i;
++
++	if (!size || (size & (PAGE_SIZE - 1)) || !pfns || !out_n_pages)
++		return NULL;
++	n_pages = size >> PAGE_SHIFT;
++	if (n_pages > pfns_capacity)
++		return NULL;
++
++	va = vmalloc(size);
++	if (!va)
++		return NULL;
++	memset(va, 0, size);
++
++	for (i = 0; i < n_pages; i++) {
++		struct page *p = vmalloc_to_page((char *)va + i * PAGE_SIZE);
++		if (!p) {
++			vfree(va);
++			return NULL;
++		}
++		pfns[i] = page_to_pfn(p);
++	}
++	*out_n_pages = n_pages;
++	return va;
++}
++EXPORT_SYMBOL_GPL(bifrost_alloc_shmem);
++
++void bifrost_free_shmem(void *addr, unsigned long size)
++{
++	(void)size;
++	if (addr)
++		vfree(addr);
++}
++EXPORT_SYMBOL_GPL(bifrost_free_shmem);
+ 
++/*
++ * SHMEM event ringbuf — Phase 2 of the bifrost data plane.
++ *
++ * The bifrost guest module pre-publishes the SHMEM region's kernel
++ * VA and ringbuf parameters via `bifrost_set_shmem_ringbuf`. The
++ * shmem_reserve / shmem_submit kfuncs (defined alongside the other
++ * bifrost kfuncs above) read the published pointer and operate
++ * directly on the in-region header.
++ *
++ * Header layout (matches host's `ShmemRingbufHdr`):
++ *   +0   u32 magic   ('BFSH', stamped at probe time)
++ *   +4   u32 version (1)
++ *   +8   u64 region_len
++ *   +16  u64 ringbuf_off       (data area start — typically 4 KB)
++ *   +24  u64 ringbuf_len       (data area length, multiple of 8)
++ *   +32  u64 producer_pos      (monotonic; offset into data = pos % len)
++ *   +40  u64 consumer_pos
++ *
++ * Record format (8-byte aligned):
++ *   +0   u32 size               (payload bytes; 0 unused for now)
++ *   +4   u32 flags              (bit 0 = ready)
++ *   +8   payload[size]
++ *   ...  pad to next 8-byte boundary
++ *
++ * v1 simplification: no wrap. Producer fails reserve once
++ * `producer_pos + aligned_size > consumer_pos + ringbuf_len` or
++ * once a record would cross the end-of-buffer boundary. The host
++ * must drain to advance consumer_pos. Wrap-aware reservation is a
++ * follow-on iteration.
++ */
++struct bifrost_shmem_ringbuf_hdr {
++	u32 magic;
++	u32 version;
++	u64 region_len;
++	u64 ringbuf_off;
++	u64 ringbuf_len;
++	atomic64_t producer_pos;
++	atomic64_t consumer_pos;
++	/* Phase 3a: BTF + kallsyms in-region. The bifrost guest
++	 * module memcpys vmlinux BTF and walked kallsyms into these
++	 * sub-regions before sending SHMEM_INIT. The host reads
++	 * them out of SHMEM directly — replaces the legacy op=4
++	 * SEND_BTF and op=5 SEND_KSYMS chunked-virtqueue protocols.
++	 */
++	u64 btf_off;
++	u64 btf_len;
++	u64 ksyms_off;
++	u64 ksyms_len;
++	/* Phase 3b reserved (per-(tgid,exec_id) VMA cache). */
++	u64 vma_cache_off;
++	u64 vma_cache_len;
++};
++
++#define BIFROST_RB_FLAG_READY     (1u << 0)
++#define BIFROST_RB_FLAG_PADDING   (1u << 1)
++#define BIFROST_RB_RECORD_HDR     8
++/* Bumped from 8 KB to 64 KB to fit agg-snapshot records (worst-
++ * case ~41 KB at 2048 entries × 20 bytes). The SHMEM ringbuf is
++ * 6 MB so even a max-size record consumes < 2 % of the buffer. */
++#define BIFROST_RB_MAX_RECORD     65536
++
++static char *bifrost_shmem_va __read_mostly;
++static unsigned long bifrost_shmem_len __read_mostly;
++
++/*
++ * Called by the bifrost guest module after the SHMEM region is
++ * allocated and the host has acked SHMEM_INIT. Initializes the
++ * ringbuf header in-place and publishes `bifrost_shmem_va` so the
++ * reserve/submit kfuncs can find it. Idempotent.
++ */
++int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
++			      unsigned long ringbuf_off,
++			      unsigned long ringbuf_len,
++			      unsigned long btf_off, unsigned long btf_len,
++			      unsigned long ksyms_off, unsigned long ksyms_len,
++			      unsigned long vma_cache_off,
++			      unsigned long vma_cache_len)
++{
++	struct bifrost_shmem_ringbuf_hdr *hdr;
++
++	if (!shmem_va || region_len < ringbuf_off + ringbuf_len)
++		return -EINVAL;
++	if (ringbuf_len & 7)
++		return -EINVAL;
++	/* Sub-region bounds checks (zero len is OK — means region
++	 * not yet populated; host treats it as absent). */
++	if (btf_len && btf_off + btf_len > region_len)
++		return -EINVAL;
++	if (ksyms_len && ksyms_off + ksyms_len > region_len)
++		return -EINVAL;
++	if (vma_cache_len && vma_cache_off + vma_cache_len > region_len)
++		return -EINVAL;
++
++	hdr = (struct bifrost_shmem_ringbuf_hdr *)shmem_va;
++	hdr->region_len = region_len;
++	hdr->ringbuf_off = ringbuf_off;
++	hdr->ringbuf_len = ringbuf_len;
++	hdr->btf_off = btf_off;
++	hdr->btf_len = btf_len;
++	hdr->ksyms_off = ksyms_off;
++	hdr->ksyms_len = ksyms_len;
++	hdr->vma_cache_off = vma_cache_off;
++	hdr->vma_cache_len = vma_cache_len;
++	atomic64_set(&hdr->producer_pos, 0);
++	atomic64_set(&hdr->consumer_pos, 0);
++	smp_wmb();
++
++	WRITE_ONCE(bifrost_shmem_va, (char *)shmem_va);
++	WRITE_ONCE(bifrost_shmem_len, region_len);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(bifrost_set_shmem_ringbuf);
++
++/*
++ * Pack the firing task's file-backed VMA table into @buf for the
++ * gustack symbolicator on the host. Each entry describes one VMA's
++ * runtime range (`start`, `end`), its file offset (so PCs can be
++ * translated to file offsets), and the path of its backing file.
++ *
++ * Wire format:
++ *   struct bifrost_vma_table_hdr {
++ *       u32 n_vmas;
++ *       u32 strings_off;   // byte offset within @buf where path strings start
++ *       u32 strings_len;   // bytes of valid path data
++ *       u32 reserved;
++ *       struct bifrost_vma_table_entry entries[n_vmas];
++ *       char strings[strings_len];   // NUL-separated d_path() outputs
++ *   };
++ *   struct bifrost_vma_table_entry {
++ *       u64 start;
++ *       u64 end;
++ *       u64 file_offset;     // pgoff << PAGE_SHIFT
++ *       u32 prot;            // VM_READ/WRITE/EXEC bits
++ *       u32 path_off;        // byte offset within strings[] (not into @buf!)
++ *   };
++ *
++ * Bounded scope: we cap at BIFROST_VMA_TABLE_MAX entries (16) — most
++ * processes have well under that many file-backed VMAs (main exe text
++ * + data + 1-2 shlibs × 2 mappings + vdso ~ 8 entries).
++ *
++ * Returns: bytes written on success, 0 if no mm or trylock failed
++ * (acceptable degradation in atomic context — host falls back to
++ * the previous record's table if cached, else raw hex), or negative
++ * errno on buffer too small.
++ *
++ * Atomic-safe: uses mmap_read_trylock so it never sleeps. d_path is
++ * spin-protected internally; safe to call from kprobe context.
++ */
++#define BIFROST_VMA_TABLE_MAX 16
++struct bifrost_vma_table_entry_kern {
++	u64 start;
++	u64 end;
++	u64 file_offset;
++	u32 prot;
++	u32 path_off;
++};
++struct bifrost_vma_table_hdr_kern {
++	u32 n_vmas;
++	u32 strings_off;
++	u32 strings_len;
++	u32 reserved;
++};
++int bifrost_emit_vma_table(struct task_struct *task, char *buf, unsigned int size)
++{
++	struct mm_struct *mm;
++	struct vm_area_struct *vma;
++	struct bifrost_vma_table_hdr_kern *hdr;
++	struct bifrost_vma_table_entry_kern *entries;
++	char *strings_base;
++	u32 entries_size, strings_off, strings_pos = 0, strings_avail;
++	u32 n = 0;
++	int ret = 0;
++
++	if (!buf || size < sizeof(*hdr) + sizeof(*entries) * 2 + 256)
++		return -EINVAL;
++	if (!task || (task->flags & PF_KTHREAD))
++		return 0;
++
++	entries_size = sizeof(*hdr) + sizeof(*entries) * BIFROST_VMA_TABLE_MAX;
++	if (size <= entries_size)
++		return -EINVAL;
++	strings_off = entries_size;
++	strings_avail = size - strings_off;
++
++	hdr = (struct bifrost_vma_table_hdr_kern *)buf;
++	entries = (struct bifrost_vma_table_entry_kern *)(buf + sizeof(*hdr));
++	strings_base = buf + strings_off;
++
++	/* Zero the header so partial fills are safe to interpret. */
++	memset(hdr, 0, sizeof(*hdr));
++	hdr->strings_off = strings_off;
++
++	mm = get_task_mm(task);
++	if (!mm) {
++		hdr->n_vmas = 0;
++		hdr->strings_len = 0;
++		return entries_size;
++	}
++
++	/* mmap_read_trylock so kprobe atomic context never sleeps. If we
++	 * lose the lock race, ferry an empty table — the host renderer
++	 * tolerates a missing or empty table by falling back to raw hex. */
++	if (!mmap_read_trylock(mm)) {
++		mmput(mm);
++		hdr->n_vmas = 0;
++		hdr->strings_len = 0;
++		return entries_size;
++	}
++
++	{
++		VMA_ITERATOR(vmi, mm, 0);
++		for_each_vma(vmi, vma) {
++			char *p;
++			const char *resolved = NULL;
++			size_t len;
++			int from_special = 0;
++
++			if (n >= BIFROST_VMA_TABLE_MAX)
++				break;
++
++			if (vma->vm_file) {
++				/* File-backed: resolve dentry chain. */
++				if (strings_pos + 1 >= strings_avail)
++					break;
++				p = strings_base + strings_pos;
++				resolved = d_path(&vma->vm_file->f_path, p,
++						  strings_avail - strings_pos);
++				if (IS_ERR(resolved))
++					continue;
++				len = strlen(resolved);
++				if (len + 1 > strings_avail - strings_pos)
++					break;
++				memmove(p, resolved, len + 1);
++			} else if (vma->vm_ops && vma->vm_ops->name) {
++				/* vDSO + similar special mappings: vm_ops->name
++				 * returns "[vdso]", "[vvar]", etc. The vDSO PCs
++				 * in user stacks live here. The host symbolicator
++				 * has special handling for "[vdso]" — looks the
++				 * PC up against vmlinux's __vdso_* symbols. */
++				const char *nm = vma->vm_ops->name(vma);
++				if (!nm)
++					continue;
++				len = strlen(nm);
++				if (len + 1 > strings_avail - strings_pos)
++					break;
++				p = strings_base + strings_pos;
++				memcpy(p, nm, len + 1);
++				resolved = p;
++				from_special = 1;
++			} else {
++				continue;
++			}
++
++			entries[n].start = vma->vm_start;
++			entries[n].end = vma->vm_end;
++			entries[n].file_offset = from_special ? 0
++				: ((u64)vma->vm_pgoff << PAGE_SHIFT);
++			entries[n].prot = (u32)(vma->vm_flags &
++						 (VM_READ | VM_WRITE | VM_EXEC));
++			entries[n].path_off = strings_pos;
++			strings_pos += len + 1;
++			n++;
++		}
++	}
++
++	mmap_read_unlock(mm);
++	mmput(mm);
++
++	hdr->n_vmas = n;
++	hdr->strings_len = strings_pos;
++	ret = strings_off + strings_pos;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(bifrost_emit_vma_table);
++
+ void bpf_list_head_free(const struct btf_field *field, void *list_head,
+ 			struct bpf_spin_lock *spin_lock)
+ {
+@@ -3066,8 +3553,353 @@
+ 		((char *)dst)[ret] = '\0';
+ 
+ 	return ret + 1;
++}
++
++/*
++ * Write current task's executable path into @buf at probe-fire time.
++ * Companion to gustack: lets the BPF program populate the record's
++ * exe_path slot before submitting, eliminating the worker-side
++ * lookup race that loses short-lived processes (cat, ls) which exit
++ * before the bifrost guest worker drains the ringbuf.
++ *
++ * Returns bytes written including NUL terminator on success, 0 if
++ * the firing context has no usable mm (kthread, exit race), negative
++ * errno on buffer too small.
++ *
++ * Non-sleepable: get_task_mm/d_path/fput/mmput are all atomic-safe.
++ */
++__bpf_kfunc int bifrost_kfunc_current_exe_path(void *buf, u32 buf__sz)
++{
++	return bifrost_task_exe_path(current, (char *)buf, buf__sz);
++}
++
++/*
++ * Pack the firing process's file-backed VMA table into @buf so the
++ * gustack symbolicator on the host can resolve PCs across libraries
++ * (libc, ld-musl, vdso) — not just the main exe. The host caches
++ * the table by gpid until the next emit.
++ *
++ * See `bifrost_emit_vma_table` for wire format.
++ */
++__bpf_kfunc int bifrost_kfunc_emit_vma_table(void *buf, u32 buf__sz)
++{
++	return bifrost_emit_vma_table(current, (char *)buf, buf__sz);
++}
++
++/*
++ * Phase 2: SHMEM event ringbuf reserve. Atomic CAS on producer_pos
++ * in the SHMEM header; returns a pointer into the data area on
++ * success, NULL on full / not-yet-initialized / size-too-large /
++ * end-of-buffer wrap. Replaces `bpf_ringbuf_reserve` in the
++ * gustack lowering when the SHMEM data plane is active.
++ *
++ * The `size__k` parameter has the `__k` suffix so the BPF verifier
++ * tracks it as a compile-time constant — paired with our verifier
++ * patch (special_kfunc_list entry), this lets the verifier type
++ * the return as `PTR_TO_MEM` with `mem_size == size__k` so the
++ * BPF program can write up to `size__k` bytes into the returned
++ * buffer. Without `__k`, the verifier treats the void* return
++ * as a scalar and rejects every subsequent store.
++ */
++/*
++ * Internal SHMEM ringbuf reserve, callable from both BPF (via
++ * the kfunc wrapper below) and regular kernel context (used by
++ * push_agg_snapshot in the bifrost guest module). Same atomic
++ * CAS + wraparound logic; just lifted out of the BPF kfunc.
++ */
++void *bifrost_shmem_reserve_kernel(u32 size)
++{
++	char *base = READ_ONCE(bifrost_shmem_va);
++	struct bifrost_shmem_ringbuf_hdr *hdr;
++	u64 aligned, cur, new_pos, cons;
++	u64 rb_off, rb_len, off_in_rb;
++	u32 *rec_hdr;
++	char *data;
++
++	if (!base || !size || size > BIFROST_RB_MAX_RECORD)
++		return NULL;
++	hdr = (struct bifrost_shmem_ringbuf_hdr *)base;
++	rb_off = hdr->ringbuf_off;
++	rb_len = hdr->ringbuf_len;
++	if (!rb_len)
++		return NULL;
++	data = base + rb_off;
++
++	aligned = ALIGN(BIFROST_RB_RECORD_HDR + size, 8);
++
++	for (;;) {
++		cur = atomic64_read(&hdr->producer_pos);
++		cons = atomic64_read(&hdr->consumer_pos);
++		off_in_rb = cur % rb_len;
++
++		/* Wraparound: when the record would cross the end-of-
++		 * buffer, atomically claim the remaining bytes as a
++		 * padding record. The consumer recognizes
++		 * BIFROST_RB_FLAG_PADDING and skips the full claimed
++		 * length. After the claim succeeds, loop again to
++		 * claim the real record at offset 0.
++		 *
++		 * pad_size is guaranteed 8-aligned because both
++		 * `cur` and `rb_len` are advanced/sized in 8-byte
++		 * units. */
++		if (off_in_rb + aligned > rb_len) {
++			u64 pad_size = rb_len - off_in_rb;
++			if (cur + pad_size - cons > rb_len)
++				return NULL; /* padding would lap consumer */
++			new_pos = cur + pad_size;
++			if (atomic64_cmpxchg(&hdr->producer_pos, cur,
++					     new_pos) != cur) {
++				cpu_relax();
++				continue;
++			}
++			/* Stamp the padding header and publish atomically
++			 * so the consumer can skip past us safely. */
++			rec_hdr = (u32 *)(data + off_in_rb);
++			rec_hdr[0] = pad_size - BIFROST_RB_RECORD_HDR;
++			smp_store_release(
++				&rec_hdr[1],
++				BIFROST_RB_FLAG_READY | BIFROST_RB_FLAG_PADDING);
++			continue;
++		}
++
++		if (cur + aligned - cons > rb_len)
++			return NULL;
++		new_pos = cur + aligned;
++		if (atomic64_cmpxchg(&hdr->producer_pos, cur, new_pos) == cur)
++			break;
++		cpu_relax();
++	}
++
++	rec_hdr = (u32 *)(data + off_in_rb);
++	rec_hdr[0] = size;
++	WRITE_ONCE(rec_hdr[1], 0); /* flags = busy */
++	return (char *)rec_hdr + BIFROST_RB_RECORD_HDR;
++}
++EXPORT_SYMBOL_GPL(bifrost_shmem_reserve_kernel);
++
++/*
++ * BPF kfunc form. Mirrors `bifrost_shmem_reserve_kernel` but
++ * with the `__k` suffix on the size arg so the verifier tracks
++ * it as a constant — paired with the verifier-side
++ * `special_kfunc_list` entry in kernel/bpf/verifier.c, this lets
++ * the verifier type the void* return as PTR_TO_MEM with
++ * mem_size == size__k so BPF programs can write up to size__k
++ * bytes into the buffer.
++ */
++__bpf_kfunc void *bifrost_kfunc_shmem_reserve(u32 size__k)
++{
++	return bifrost_shmem_reserve_kernel(size__k);
++}
++
++/*
++ * Internal SHMEM ringbuf submit (kernel-context form).
++ */
++void bifrost_shmem_submit_kernel(void *ptr)
++{
++	u32 *flags;
++
++	if (!ptr)
++		return;
++	flags = (u32 *)((char *)ptr - 4);
++	smp_store_release(flags, BIFROST_RB_FLAG_READY);
+ }
++EXPORT_SYMBOL_GPL(bifrost_shmem_submit_kernel);
+ 
++/*
++ * Mark a previously-reserved record ready. Release-store on the
++ * flags field pairs with the consumer's acquire-load so all prior
++ * payload writes are visible.
++ *
++ * The `ptr__ign` arg uses the `__ign` suffix so the BPF verifier
++ * doesn't require a typed pointer — submit accepts whatever the
++ * companion reserve returned (PTR_TO_MEM after our verifier patch).
++ */
++__bpf_kfunc void bifrost_kfunc_shmem_submit(void *ptr__ign)
++{
++	bifrost_shmem_submit_kernel(ptr__ign);
++}
++
++/*
++ * Phase 3b: VMA-table publish-on-first-fire-per-(tgid, exec_id).
++ *
++ * Replaces the per-fire VMA-table side-trip emitted by gustack
++ * lowering. Internal flow:
++ *   1. Compute key = (tgid << 32) | exec_id  (exec_id from
++ *      current->self_exec_id — bumps on execve).
++ *   2. Linear-probe a small in-module hash table for the key.
++ *   3. If found, return 0 (already published — caller skips).
++ *   4. Otherwise: reserve a 2560-byte record in the SHMEM ringbuf,
++ *      stamp correlation (vmid=0, probe_id=0xFFFFFFFF magic, ktime,
++ *      pid_tgid), fill body via bifrost_emit_vma_table, submit.
++ *      Insert key into the hash table.
++ *
++ * Returns 1 on publish, 0 on skip (already seen), negative on
++ * out-of-space / hash-table-full.
++ */
++#define BIFROST_VMA_PUB_BUCKETS 4096
++#define BIFROST_VMA_PUB_PROBE_DEPTH 16
++#define BIFROST_VMA_PUB_PROBE_MAGIC 0xFFFFFFFFu
++#define BIFROST_VMA_REC_SIZE 2560
++#define BIFROST_VMA_REC_BODY_SIZE (BIFROST_VMA_REC_SIZE - 24)
++
++struct bifrost_vma_pub_entry {
++	u64 key; /* (tgid << 32) | exec_id; 0 == empty */
++};
++static struct bifrost_vma_pub_entry
++	bifrost_vma_pub_table[BIFROST_VMA_PUB_BUCKETS];
++static DEFINE_SPINLOCK(bifrost_vma_pub_lock);
++
++static bool bifrost_vma_pub_test_and_set(u32 tgid, u32 exec_id)
++{
++	u64 key = ((u64)tgid << 32) | exec_id;
++	u32 idx, i;
++	bool already_seen = false;
++	unsigned long flags;
++
++	if (key == 0)
++		key = 1; /* avoid 0 sentinel; not strictly necessary */
++	idx = hash_64(key, 12) & (BIFROST_VMA_PUB_BUCKETS - 1);
++
++	spin_lock_irqsave(&bifrost_vma_pub_lock, flags);
++	for (i = 0; i < BIFROST_VMA_PUB_PROBE_DEPTH; i++) {
++		u32 slot = (idx + i) & (BIFROST_VMA_PUB_BUCKETS - 1);
++		if (bifrost_vma_pub_table[slot].key == key) {
++			already_seen = true;
++			break;
++		}
++		if (bifrost_vma_pub_table[slot].key == 0) {
++			bifrost_vma_pub_table[slot].key = key;
++			break;
++		}
++	}
++	/* Probe overflow: treat as not-seen so we re-emit; bounded
++	 * extra cost is acceptable vs. losing the VMA table. */
++	spin_unlock_irqrestore(&bifrost_vma_pub_lock, flags);
++	return already_seen;
++}
++
++/*
++ * Phase 4 doorbell. The bifrost guest module publishes a
++ * `void (*kick_doorbell)(void *priv)` callback + private cookie
++ * via `bifrost_set_doorbell_callback`; this kfunc invokes it. The
++ * callback does a single virtqueue_kick on the dedicated
++ * vq_doorbell — host's vq_doorbell handler signals an EventFd
++ * that the SHMEM consumer thread blocks on (kqueue/poll), waking
++ * it within ~3-10 µs of this kfunc's return (per HVF spike).
++ *
++ * Rate-limiting: only fires the doorbell when the consumer has
++ * fallen behind by more than `BIFROST_DOORBELL_THRESHOLD_BYTES`
++ * bytes (producer_pos / consumer_pos are byte-counted). Sized at
++ * 4 KB ≈ 6-8 typical records — long enough that the consumer's
++ * brief busy-poll (16 × 100 µs = 1.6 ms) has a chance to drain
++ * the queue before we MMIO-trap.
++ */
++#define BIFROST_DOORBELL_THRESHOLD_BYTES 4096
++typedef void (*bifrost_kick_fn_t)(void *priv);
++static bifrost_kick_fn_t bifrost_kick_fn __read_mostly;
++static void *bifrost_kick_priv __read_mostly;
++
++int bifrost_set_doorbell_callback(bifrost_kick_fn_t fn, void *priv)
++{
++	WRITE_ONCE(bifrost_kick_priv, priv);
++	smp_wmb();
++	WRITE_ONCE(bifrost_kick_fn, fn);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(bifrost_set_doorbell_callback);
++
++__bpf_kfunc void bifrost_kfunc_shmem_kick(void)
++{
++	char *base = READ_ONCE(bifrost_shmem_va);
++	struct bifrost_shmem_ringbuf_hdr *hdr;
++	bifrost_kick_fn_t fn;
++	u64 prod, cons;
++
++	fn = READ_ONCE(bifrost_kick_fn);
++	if (!fn || !base)
++		return;
++	hdr = (struct bifrost_shmem_ringbuf_hdr *)base;
++	prod = atomic64_read(&hdr->producer_pos);
++	cons = atomic64_read(&hdr->consumer_pos);
++	/* Only fire when the consumer has fallen meaningfully behind.
++	 * False negatives (consumer asleep but distance < threshold)
++	 * are bounded — the consumer's 1 ms poll-timeout fallback
++	 * picks them up. Eliminates per-fire MMIO trap cost. */
++	if (prod - cons < BIFROST_DOORBELL_THRESHOLD_BYTES)
++		return;
++	fn(READ_ONCE(bifrost_kick_priv));
++}
++
++__bpf_kfunc int bifrost_kfunc_publish_vma_table(void)
++{
++	struct task_struct *task = current;
++	u64 pid_tgid;
++	u32 tgid, exec_id;
++	char *base;
++	struct bifrost_shmem_ringbuf_hdr *hdr;
++	u64 aligned, cur, new_pos, cons;
++	u64 rb_off, rb_len, off_in_rb;
++	u32 *rec_hdr;
++	u8 *data, *rec, *body;
++	int written;
++
++	if (!task || (task->flags & PF_KTHREAD))
++		return 0;
++	pid_tgid = ((u64)task->tgid << 32) | (u32)task->pid;
++	tgid = task->tgid;
++	exec_id = task->self_exec_id;
++
++	if (bifrost_vma_pub_test_and_set(tgid, exec_id))
++		return 0; /* already published */
++
++	base = READ_ONCE(bifrost_shmem_va);
++	if (!base)
++		return -ENOENT;
++	hdr = (struct bifrost_shmem_ringbuf_hdr *)base;
++	rb_off = hdr->ringbuf_off;
++	rb_len = hdr->ringbuf_len;
++	if (!rb_len)
++		return -ENOENT;
++	data = (u8 *)base + rb_off;
++	aligned = ALIGN(BIFROST_RB_RECORD_HDR + BIFROST_VMA_REC_SIZE, 8);
++
++	for (;;) {
++		cur = atomic64_read(&hdr->producer_pos);
++		cons = atomic64_read(&hdr->consumer_pos);
++		off_in_rb = cur % rb_len;
++		if (off_in_rb + aligned > rb_len)
++			return -ENOSPC;
++		if (cur + aligned - cons > rb_len)
++			return -ENOSPC;
++		new_pos = cur + aligned;
++		if (atomic64_cmpxchg(&hdr->producer_pos, cur, new_pos) == cur)
++			break;
++		cpu_relax();
++	}
++
++	rec_hdr = (u32 *)(data + off_in_rb);
++	rec_hdr[0] = BIFROST_VMA_REC_SIZE;
++	WRITE_ONCE(rec_hdr[1], 0); /* busy */
++	rec = (u8 *)rec_hdr + BIFROST_RB_RECORD_HDR;
++	/* Correlation header. */
++	*(u32 *)(rec + 0) = 0;                                /* vmid */
++	*(u32 *)(rec + 4) = BIFROST_VMA_PUB_PROBE_MAGIC;       /* probe_id */
++	*(u64 *)(rec + 8) = ktime_get_ns();                    /* gns */
++	*(u64 *)(rec + 16) = pid_tgid;                         /* gpid */
++	/* Body. */
++	body = rec + 24;
++	written = bifrost_emit_vma_table(task, (char *)body,
++					 BIFROST_VMA_REC_BODY_SIZE);
++	if (written < 0) {
++		/* Best effort: zero the body and submit anyway so the
++		 * host doesn't choke on stale memory. */
++		memset(body, 0, BIFROST_VMA_REC_BODY_SIZE);
++	}
++	/* Publish. */
++	smp_store_release(&rec_hdr[1], BIFROST_RB_FLAG_READY);
++	return 1;
++}
++
+ __bpf_kfunc_end_defs();
+ 
+ BTF_KFUNCS_START(generic_btf_ids)
+@@ -3154,6 +3986,12 @@
+ BTF_ID_FLAGS(func, bpf_iter_bits_next, KF_ITER_NEXT | KF_RET_NULL)
+ BTF_ID_FLAGS(func, bpf_iter_bits_destroy, KF_ITER_DESTROY)
+ BTF_ID_FLAGS(func, bpf_copy_from_user_str, KF_SLEEPABLE)
++BTF_ID_FLAGS(func, bifrost_kfunc_current_exe_path)
++BTF_ID_FLAGS(func, bifrost_kfunc_emit_vma_table)
++BTF_ID_FLAGS(func, bifrost_kfunc_shmem_reserve, KF_RET_NULL)
++BTF_ID_FLAGS(func, bifrost_kfunc_shmem_submit)
++BTF_ID_FLAGS(func, bifrost_kfunc_publish_vma_table)
++BTF_ID_FLAGS(func, bifrost_kfunc_shmem_kick)
+ BTF_KFUNCS_END(common_btf_ids)
+ 
+ static const struct btf_kfunc_id_set common_kfunc_set = {
+--- a/rust/bindings/bindings_helper.h	2026-04-28 22:00:55
++++ b/rust/bindings/bindings_helper.h	2026-04-29 06:53:46
+@@ -27,6 +27,106 @@
+ #include <linux/bpf.h>
+ #include <linux/filter.h>
+ 
++/* Bifrost helper-proto resolver, defined in kernel/bpf/helpers.c.
++ * Exposed here so bindgen picks it up for the bifrost_guest module. */
++extern const struct bpf_func_proto *bifrost_get_func_proto(enum bpf_func_id func_id);
++/* Bifrost vmlinux BTF range accessor (kernel/bpf/helpers.c). */
++extern const void *bifrost_btf_data(unsigned long *size);
++/* Bifrost kallsyms walker — invokes cb(data, name, addr) for each symbol. */
++extern int bifrost_walk_kallsyms(int (*cb)(void *, const char *, unsigned long), void *data);
++/* Bifrost stack walker — wraps stack_trace_save_regs (kernel-internal). */
++extern unsigned int bifrost_stack_walk(struct pt_regs *regs, unsigned long *store,
++				       unsigned int nr, unsigned int skipnr);
++/* Bifrost exe-path helper — writes the given task's executable path
++ * (mm->exe_file's d_path) into `buf`. Returns bytes written, 0 if
++ * unavailable, negative errno on error. Companion to gustack — gives
++ * the host the ELF file to symbolicate frames against. */
++extern int bifrost_task_exe_path(struct task_struct *task, char *buf, unsigned int size);
++/* Bifrost VMA-table emitter — packs the task's file-backed VMAs
++ * into `buf`. See `bifrost_emit_vma_table` in kernel/bpf/helpers.c
++ * for wire format. Returns bytes written, 0 if no mm/trylock failed,
++ * or negative errno on buffer too small. */
++extern int bifrost_emit_vma_table(struct task_struct *task, char *buf, unsigned int size);
++/* Bifrost SHMEM allocator — vmalloc-backed (non-contiguous physical,
++ * contiguous kernel-virt). Caller provides a `pfns` array; the
++ * helper walks vmalloc_to_pfn for each PAGE_SIZE chunk. The host
++ * derives per-page host VAs via vm-memory using each PFN. */
++extern void *bifrost_alloc_shmem(unsigned long size, unsigned long *pfns,
++				  unsigned long pfns_capacity,
++				  unsigned long *out_n_pages);
++extern void bifrost_free_shmem(void *addr, unsigned long size);
++/* Bifrost SHMEM event-ringbuf publisher. The bifrost_guest module
++ * calls this once after SHMEM_INIT has been acked by the host so
++ * the bifrost_kfunc_shmem_reserve/_submit kfuncs can find the
++ * region. Phase 3a extends with BTF/kallsyms/VMA-cache sub-region
++ * offsets so the host can read them directly out of SHMEM
++ * (replacing op=4/op=5 chunked virtqueue transport). Returns 0
++ * on success, -EINVAL on bad args. */
++extern int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
++				      unsigned long ringbuf_off,
++				      unsigned long ringbuf_len,
++				      unsigned long btf_off,
++				      unsigned long btf_len,
++				      unsigned long ksyms_off,
++				      unsigned long ksyms_len,
++				      unsigned long vma_cache_off,
++				      unsigned long vma_cache_len);
++/* Phase 4 doorbell wiring: bifrost_guest module passes a kick fn +
++ * private cookie; bifrost_kfunc_shmem_kick invokes them when the
++ * consumer has fallen behind. The kick fn does virtqueue_kick on
++ * the dedicated vq_doorbell. */
++typedef void (*bifrost_kick_fn_t)(void *priv);
++extern int bifrost_set_doorbell_callback(bifrost_kick_fn_t fn, void *priv);
++/* Kernel-context SHMEM ringbuf reserve/submit. Callable from the
++ * bifrost guest module's worker thread (e.g. push_agg_snapshot)
++ * to publish records into the SHMEM event ringbuf without going
++ * through BPF. Same atomic CAS + wraparound semantics as the BPF
++ * kfunc form `bifrost_kfunc_shmem_reserve`. */
++extern void *bifrost_shmem_reserve_kernel(unsigned int size);
++extern void bifrost_shmem_submit_kernel(void *ptr);
++/* Bifrost task lookup by tgid. Returns NULL if no such task; caller
++ * must put_task_struct via bifrost_put_task. */
++extern struct task_struct *bifrost_find_task_by_tgid(unsigned int tgid);
++extern void bifrost_put_task(struct task_struct *t);
++/* Bifrost map allocation shim (kernel/bpf/syscall.c). Returns a real
++ * bpf_map (PERCPU_ARRAY / HASH / PERCPU_HASH / etc.) with .ops set so
++ * subsequent JIT'd eBPF can call bpf_map_lookup_elem / update_elem
++ * natively. Replaces the legacy custom bifrost_agg_inc helper path. */
++extern struct bpf_map *bifrost_alloc_map(unsigned int map_type,
++					 unsigned int key_size,
++					 unsigned int value_size,
++					 unsigned int max_entries);
++extern void bifrost_free_map(struct bpf_map *map);
++/* In-kernel readback shims for the snapshot worker. The standard
++ * `bpf_map_lookup_elem` C function isn't EXPORT_SYMBOL'd. */
++extern void *bifrost_map_lookup_elem(struct bpf_map *map, const void *key);
++extern int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_key);
++/* Bifrost per-cpu-aware u64 reader for the snapshot worker. For
++ * PERCPU_ARRAY / PERCPU_HASH maps sums all per-cpu slots into a
++ * single u64; for non-percpu maps falls back to a single
++ * map_lookup_elem read. */
++extern int bifrost_map_lookup_sum_u64(struct bpf_map *map, const void *key, unsigned long long *out_sum);
++/* Bifrost verifier shim — runs the standard kernel BPF verifier
++ * via bpf_check, with verbose output to dmesg via BPF_LOG_KERNEL.
++ * Caller must (a) bpf_prog_alloc + set type/len + copy insns,
++ * (b) for any LD_DW_IMM with src_reg=BPF_PSEUDO_MAP_FD ensure
++ * imm holds a real fd resolvable via __bpf_map_get. */
++extern int bifrost_verify_prog(struct bpf_prog **prog);
++/* Anon-inode-fd allocator wrapping bpf_map_new_fd; lets the guest
++ * module bind a real fd to each bpf_map for the verifier's
++ * resolution pass. Returns the fd or a negative errno. */
++extern int bifrost_map_get_fd(struct bpf_map *map, int flags);
++/* close_fd from fs/file.c — releases an fd in the current task's
++ * file table. Used to release fds bifrost_map_get_fd allocates
++ * once the verifier has resolved them in the program. */
++extern int close_fd(unsigned int fd);
++/* __cond_resched: yield CPU if needed. Used inside the legacy
++ * chunked-send spin loops (now retired post-Phase 3a) and any
++ * future long-running kernel loops that need to play nice with
++ * RCU. The kernel's `cond_resched()` is a preprocessor macro
++ * that wraps this. */
++extern int __cond_resched(void);
++
+ /* `bindgen` gets confused at certain things. */
+ const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
+ const size_t RUST_CONST_HELPER_PAGE_SIZE = PAGE_SIZE;
+--- a/kernel/bpf/verifier.c	2026-03-05 07:04:32
++++ b/kernel/bpf/verifier.c	2026-04-28 22:42:08
+@@ -11395,6 +11395,7 @@
+ 	KF_bpf_preempt_enable,
+ 	KF_bpf_iter_css_task_new,
+ 	KF_bpf_session_cookie,
++	KF_bifrost_kfunc_shmem_reserve,
+ };
+ 
+ BTF_SET_START(special_kfunc_set)
+@@ -11422,6 +11423,7 @@
+ #ifdef CONFIG_CGROUPS
+ BTF_ID(func, bpf_iter_css_task_new)
+ #endif
++BTF_ID(func, bifrost_kfunc_shmem_reserve)
+ BTF_SET_END(special_kfunc_set)
+ 
+ BTF_ID_LIST(special_kfunc_list)
+@@ -11460,6 +11462,7 @@
+ #else
+ BTF_ID_UNUSED
+ #endif
++BTF_ID(func, bifrost_kfunc_shmem_reserve)
+ 
+ static bool is_kfunc_ret_null(struct bpf_kfunc_call_arg_meta *meta)
+ {
+@@ -12890,6 +12893,22 @@
+ 				regs[BPF_REG_0].type = PTR_TO_BTF_ID | PTR_UNTRUSTED;
+ 				regs[BPF_REG_0].btf = desc_btf;
+ 				regs[BPF_REG_0].btf_id = meta.arg_constant.value;
++			} else if (meta.func_id == special_kfunc_list[KF_bifrost_kfunc_shmem_reserve]) {
++				/* bifrost SHMEM event-ringbuf reserve: returns a
++				 * writable PTR_TO_MEM of size `size__k` (the
++				 * constant arg, tracked by the verifier via the
++				 * __k suffix), or NULL. Mirrors the
++				 * bpf_dynptr_slice_rdwr shape. KF_RET_NULL on the
++				 * BTF_ID_FLAGS line adds PTR_MAYBE_NULL.
++				 */
++				mark_reg_known_zero(env, regs, BPF_REG_0);
++				if (!meta.arg_constant.found) {
++					verbose(env,
++						"verifier internal error: bifrost_kfunc_shmem_reserve no constant size\n");
++					return -EFAULT;
++				}
++				regs[BPF_REG_0].mem_size = meta.arg_constant.value;
++				regs[BPF_REG_0].type = PTR_TO_MEM;
+ 			} else if (meta.func_id == special_kfunc_list[KF_bpf_dynptr_slice] ||
+ 				   meta.func_id == special_kfunc_list[KF_bpf_dynptr_slice_rdwr]) {
+ 				enum bpf_type_flag type_flag = get_dynptr_type_flag(meta.initialized_dynptr.type);
