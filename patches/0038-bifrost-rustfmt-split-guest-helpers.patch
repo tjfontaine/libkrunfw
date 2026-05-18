@@ -1,0 +1,179 @@
+From d2d9fe45b56fad77c96fa3ab59a0cf5c4650b066 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Mon, 11 May 2026 21:45:27 -0700
+Subject: [PATCH] bifrost: rustfmt split guest helpers
+
+---
+ drivers/bifrost/load_prog_parse.rs |  9 ++++++---
+ drivers/bifrost/record_writer.rs   | 12 ++----------
+ drivers/bifrost/shmem_publish.rs   | 18 +++++++++---------
+ drivers/bifrost/slots.rs           | 12 +++---------
+ drivers/bifrost/task_helpers.rs    |  4 +---
+ 5 files changed, 21 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/bifrost/load_prog_parse.rs b/drivers/bifrost/load_prog_parse.rs
+index 547f12800853..e41717164382 100644
+--- a/drivers/bifrost/load_prog_parse.rs
++++ b/drivers/bifrost/load_prog_parse.rs
+@@ -8,8 +8,8 @@
+ use crate::bpf_consts::{BPF_LD_IMM64, BPF_PSEUDO_MAP_FD};
+ use crate::types::{BifrostCmd, BpfInsn, MapDef};
+ use crate::wire::{
+-    PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE,
+-    PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
++    PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM,
++    PROBE_TYPE_USDT,
+ };
+ 
+ pub(crate) unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32) -> c_int {
+@@ -121,7 +121,10 @@ pub(crate) unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32
+         }
+ 
+         if num_maps > 8 {
+-            pr_err!("bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap 8\n", num_maps);
++            pr_err!(
++                "bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap 8\n",
++                num_maps
++            );
+             return -(bindings::EINVAL as i32);
+         }
+         let map_bytes = match num_maps.checked_mul(MAP_DEF_SIZE) {
+diff --git a/drivers/bifrost/record_writer.rs b/drivers/bifrost/record_writer.rs
+index 2b56c3c29714..6bc5b74b3636 100644
+--- a/drivers/bifrost/record_writer.rs
++++ b/drivers/bifrost/record_writer.rs
+@@ -78,11 +78,7 @@ pub(crate) fn write_bytes(&mut self, src: &[u8]) -> bool {
+             return false;
+         }
+         unsafe {
+-            core::ptr::copy_nonoverlapping(
+-                src.as_ptr(),
+-                self.base.add(self.off),
+-                src.len(),
+-            );
++            core::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(self.off), src.len());
+         }
+         self.off += src.len();
+         true
+@@ -95,11 +91,7 @@ pub(crate) fn poke_u32(&mut self, off: usize, val: u32) -> bool {
+             return false;
+         }
+         unsafe {
+-            core::ptr::copy_nonoverlapping(
+-                &val as *const u32 as *const u8,
+-                self.base.add(off),
+-                4,
+-            );
++            core::ptr::copy_nonoverlapping(&val as *const u32 as *const u8, self.base.add(off), 4);
+         }
+         true
+     }
+diff --git a/drivers/bifrost/shmem_publish.rs b/drivers/bifrost/shmem_publish.rs
+index 41892d8208cf..6adbc22b9186 100644
+--- a/drivers/bifrost/shmem_publish.rs
++++ b/drivers/bifrost/shmem_publish.rs
+@@ -41,7 +41,8 @@ pub(crate) unsafe fn populate_shmem_btf(shmem_va: *mut u8) -> usize {
+         if size > SHMEM_BTF_CAP {
+             pr_err!(
+                 "bifrost_guest: vmlinux BTF too large ({} > {} cap)\n",
+-                size, SHMEM_BTF_CAP
++                size,
++                SHMEM_BTF_CAP
+             );
+             return 0;
+         }
+@@ -49,7 +50,8 @@ pub(crate) unsafe fn populate_shmem_btf(shmem_va: *mut u8) -> usize {
+         core::ptr::copy_nonoverlapping(btf_start, dst, size);
+         pr_info!(
+             "bifrost_guest: BTF placed at SHMEM offset {} ({} bytes)\n",
+-            SHMEM_BTF_OFF, size
++            SHMEM_BTF_OFF,
++            size
+         );
+         size
+     }
+@@ -78,12 +80,14 @@ pub(crate) unsafe fn populate_shmem_kallsyms(shmem_va: *mut u8) -> usize {
+         if acc.overflow {
+             pr_err!(
+                 "bifrost_guest: kallsyms truncated at {} bytes ({} cap)\n",
+-                acc.pos, SHMEM_KSYMS_CAP
++                acc.pos,
++                SHMEM_KSYMS_CAP
+             );
+         }
+         pr_info!(
+             "bifrost_guest: kallsyms placed at SHMEM offset {} ({} bytes)\n",
+-            SHMEM_KSYMS_OFF, acc.pos
++            SHMEM_KSYMS_OFF,
++            acc.pos
+         );
+         acc.pos
+     }
+@@ -96,11 +100,7 @@ struct ShmemKsymsAccum {
+     overflow: bool,
+ }
+ 
+-unsafe extern "C" fn shmem_ksyms_cb(
+-    data: *mut c_void,
+-    name: *const c_char,
+-    addr: usize,
+-) -> c_int {
++unsafe extern "C" fn shmem_ksyms_cb(data: *mut c_void, name: *const c_char, addr: usize) -> c_int {
+     unsafe {
+         let acc = data as *mut ShmemKsymsAccum;
+         if (*acc).overflow || name.is_null() {
+diff --git a/drivers/bifrost/slots.rs b/drivers/bifrost/slots.rs
+index ee78cbfba61d..8adcd95acc00 100644
+--- a/drivers/bifrost/slots.rs
++++ b/drivers/bifrost/slots.rs
+@@ -6,7 +6,7 @@
+ use kernel::bindings;
+ use kernel::prelude::*;
+ 
+-use crate::wire::{PROBE_TYPE_NONE, MAX_PROBE_SLOTS};
++use crate::wire::{MAX_PROBE_SLOTS, PROBE_TYPE_NONE};
+ 
+ /// Initial slot-table capacity allocated at module init.
+ ///
+@@ -104,8 +104,7 @@ pub(crate) fn bifrost_slots_init() -> Result<()> {
+         if BIFROST_SLOTS_OPT.is_some() {
+             return Ok(());
+         }
+-        let mut v: KVec<KBox<BifrostSlot>> =
+-            KVec::with_capacity(INITIAL_SLOT_HINT, GFP_KERNEL)?;
++        let mut v: KVec<KBox<BifrostSlot>> = KVec::with_capacity(INITIAL_SLOT_HINT, GFP_KERNEL)?;
+         for _ in 0..INITIAL_SLOT_HINT {
+             let b = KBox::new(BifrostSlot::new(), GFP_KERNEL)?;
+             v.push(b, GFP_KERNEL)?;
+@@ -135,12 +134,7 @@ pub(crate) unsafe fn slots_ensure(n: usize) -> Result<()> {
+ /// SAFETY: caller must ensure `bifrost_slots_init()` has run.
+ #[inline]
+ pub(crate) unsafe fn slots_mut() -> &'static mut [KBox<BifrostSlot>] {
+-    unsafe {
+-        BIFROST_SLOTS_OPT
+-            .as_mut()
+-            .unwrap_unchecked()
+-            .as_mut_slice()
+-    }
++    unsafe { BIFROST_SLOTS_OPT.as_mut().unwrap_unchecked().as_mut_slice() }
+ }
+ 
+ /// Allocate a fresh non-zero slot lease.
+diff --git a/drivers/bifrost/task_helpers.rs b/drivers/bifrost/task_helpers.rs
+index 9458e318afda..f156f973d0e2 100644
+--- a/drivers/bifrost/task_helpers.rs
++++ b/drivers/bifrost/task_helpers.rs
+@@ -42,9 +42,7 @@ pub(crate) unsafe fn find_task_by_comm(target: &[u8]) -> *mut bindings::task_str
+     if target.is_empty() {
+         return core::ptr::null_mut();
+     }
+-    unsafe {
+-        bifrost_helper_find_task_by_comm(target.as_ptr(), target.len() as u32)
+-    }
++    unsafe { bifrost_helper_find_task_by_comm(target.as_ptr(), target.len() as u32) }
+ }
+ 
+ /// Release a task reference returned by `find_task_by_comm`.
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,591 @@
+From 13ed24d66f1b7877b330cb067bc8614d3cb272a2 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Sun, 17 May 2026 18:22:28 -0700
+Subject: bifrost: profile-timer probe type and quantize key restructure
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PROBE_TYPE_PROFILE_TIMER=10: new attach kind for the host-side
+profile:::tick-Nms route.  load_prog_parse decodes a u64 period_ns
+trailer; attach.rs's PROFILE_TIMER arm opens a per-CPU perf_event
+(PERF_TYPE_SOFTWARE / PERF_COUNT_SW_CPU_CLOCK with sample_period =
+period_ns), then attaches the BPF program via
+perf_event_set_bpf_prog.  Bumps BIFROST_NUM_KPROBES so peer
+LOAD_PROGs land in subsequent slots instead of overwriting.
+bifrost.rs routes prog->type through bifrost_set_prog_type(
+BPF_PROG_TYPE_PERF_EVENT=7) before the verifier so env->ops is
+populated.  Slot tracks a perf_event handle; cleanup releases it
+via perf_event_release_kernel.
+
+AGG_KIND_QUANTIZE=7: quantize aggs now use PERCPU_ARRAY[1] with a
+DTRACE_QUANTIZE_NBUCKETS * sizeof(u64) = 1016-byte value (the full
+bucket array), rather than splitting per-bucket rows keyed on
+bucket-id.  agg_snapshot.rs handles AGG_KIND_QUANTIZE by walking
+the per-CPU array bucket-wise via a new
+bifrost_map_lookup_quantize_buckets reducer in
+kernel/bpf/syscall.c, then emits ONE row per (name, user-key)
+with the full bucket array as the value.  For unkeyed
+quantize (PERCPU_ARRAY[1] case) the wire k_size=0 so the host's
+CrossTargetAggReducer keys it identically to FreeBSD's empty-key
+quantize row — both kernels' contributions fold into one
+cross-target histogram cell.
+
+bindings_helper.h exposes perf_event_attr +
+perf_event_create_kernel_counter + perf_event_set_bpf_prog +
+perf_event_release_kernel for the bifrost driver, and the new
+bifrost_map_lookup_quantize_buckets reducer.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/bifrost/agg_snapshot.rs    |  65 ++++++++++++--
+ drivers/bifrost/attach.rs          | 133 ++++++++++++++++++++++++++++-
+ drivers/bifrost/bifrost.rs         |  29 ++++++-
+ drivers/bifrost/load_prog_parse.rs |  20 ++++-
+ drivers/bifrost/slots.rs           |   4 +
+ drivers/bifrost/wire.rs            |  30 ++++++-
+ kernel/bpf/syscall.c               |  54 ++++++++++++
+ rust/bindings/bindings_helper.h    |   9 ++
+ 8 files changed, 330 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/bifrost/agg_snapshot.rs b/drivers/bifrost/agg_snapshot.rs
+index e3a3bd90609d..eb4544102243 100644
+--- a/drivers/bifrost/agg_snapshot.rs
++++ b/drivers/bifrost/agg_snapshot.rs
+@@ -7,10 +7,11 @@
+ use crate::bpf_consts::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF};
+ use crate::record_writer::RecordWriter;
+ use crate::wire::{
+-    AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_KIND_STDDEV, AGG_SNAPSHOT_PROBE_ID,
+-    AGG_SNAPSHOT_ROW_KIND_AVG, AGG_SNAPSHOT_ROW_KIND_MAX, AGG_SNAPSHOT_ROW_KIND_MIN,
+-    AGG_SNAPSHOT_ROW_KIND_STDDEV, AGG_SNAPSHOT_ROW_KIND_SUM, AGG_SNAPSHOT_ROW_KIND_UNKNOWN,
+-    AGG_SNAPSHOT_SCHEMA_V1, SHMEM_DROP_CLASS_AGG,
++    AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_KIND_QUANTIZE, AGG_KIND_STDDEV,
++    AGG_SNAPSHOT_PROBE_ID, AGG_SNAPSHOT_ROW_KIND_AVG, AGG_SNAPSHOT_ROW_KIND_MAX,
++    AGG_SNAPSHOT_ROW_KIND_MIN, AGG_SNAPSHOT_ROW_KIND_QUANTIZE, AGG_SNAPSHOT_ROW_KIND_STDDEV,
++    AGG_SNAPSHOT_ROW_KIND_SUM, AGG_SNAPSHOT_ROW_KIND_UNKNOWN, AGG_SNAPSHOT_SCHEMA_V1,
++    DTRACE_QUANTIZE_NBUCKETS, QUANTIZE_VALUE_SIZE, SHMEM_DROP_CLASS_AGG,
+ };
+ 
+ /// Translate the kernel-internal per-map agg-kind flag to the
+@@ -29,6 +30,7 @@ fn agg_snapshot_row_kind(agg_kind_u8: u8) -> u8 {
+         AGG_KIND_MAX => AGG_SNAPSHOT_ROW_KIND_MAX,
+         AGG_KIND_AVG => AGG_SNAPSHOT_ROW_KIND_AVG,
+         AGG_KIND_STDDEV => AGG_SNAPSHOT_ROW_KIND_STDDEV,
++        AGG_KIND_QUANTIZE => AGG_SNAPSHOT_ROW_KIND_QUANTIZE,
+         _ => AGG_SNAPSHOT_ROW_KIND_UNKNOWN,
+     }
+ }
+@@ -118,6 +120,43 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+             let chk = writer.off;
+             let kind = agg_snapshot_row_kind(agg_kind);
+             let ok = match agg_kind {
++                AGG_KIND_QUANTIZE => {
++                    // Track B P0 #7: walk the per-CPU
++                    // QUANTIZE_VALUE_SIZE byte bucket array, sum
++                    // bucket-wise across CPUs, and emit ONE row
++                    // with the full array as the value.  Matches
++                    // FreeBSD libdtrace's wire shape so the host's
++                    // CrossTargetAggReducer folds both kernels'
++                    // contributions into one histogram cell.
++                    let n = DTRACE_QUANTIZE_NBUCKETS;
++                    let mut buckets: [u64; DTRACE_QUANTIZE_NBUCKETS] =
++                        [0u64; DTRACE_QUANTIZE_NBUCKETS];
++                    let rc = bindings::bifrost_map_lookup_quantize_buckets(
++                        map,
++                        k_ptr,
++                        buckets.as_mut_ptr(),
++                        n as u32,
++                    );
++                    if rc != 0 {
++                        return false;
++                    }
++                    // Skip rows with no fires at all (saves wire
++                    // bytes when a quantize agg was declared but
++                    // the probe never matched on this CPU).
++                    let any = buckets.iter().any(|&v| v != 0);
++                    if !any {
++                        return false;
++                    }
++                    let mut wrote = writer.write_i32(fd)
++                        && writer.write_bytes(&[kind, 0, 0, 0])
++                        && writer.write_u32(k_size)
++                        && writer.write_bytes(k_bytes)
++                        && writer.write_u32(QUANTIZE_VALUE_SIZE);
++                    for i in 0..n {
++                        wrote = wrote && writer.write_u64(buckets[i]);
++                    }
++                    wrote
++                }
+                 AGG_KIND_STDDEV => {
+                     let mut n: u64 = 0;
+                     let mut sum: u64 = 0;
+@@ -190,14 +229,28 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+                     }
+                     let k32: u32 = k;
+                     let k_bytes = k32.to_le_bytes();
++                    // Track B P0 #7: AGG_KIND_QUANTIZE on a
++                    // PERCPU_ARRAY[1] represents an unkeyed
++                    // `@latency = quantize(...)`.  The map index
++                    // 0 is an internal lookup detail, not a
++                    // user-visible key — emit k_size=0 on the
++                    // wire so the host's CrossTargetAggReducer
++                    // keys this row identically to FreeBSD's
++                    // libdtrace-emitted empty-key quantize row
++                    // and folds both into one histogram cell.
++                    let (k_size, k_slice): (u32, &[u8]) = if agg_kind == AGG_KIND_QUANTIZE {
++                        (0, &[][..])
++                    } else {
++                        (4, &k_bytes[..])
++                    };
+                     if pack_row(
+                         &mut writer,
+                         fd,
+                         agg_kind,
+                         map,
+                         &k32 as *const u32 as *const core::ffi::c_void,
+-                        4,
+-                        &k_bytes,
++                        k_size,
++                        k_slice,
+                     ) {
+                         packed += 1;
+                     }
+diff --git a/drivers/bifrost/attach.rs b/drivers/bifrost/attach.rs
+index 6ea5392b46c0..dd028e42da47 100644
+--- a/drivers/bifrost/attach.rs
++++ b/drivers/bifrost/attach.rs
+@@ -13,14 +13,30 @@
+ use crate::task_helpers::TaskRef;
+ use crate::uprobe_handlers::{bifrost_uprobe_handler, bifrost_uretprobe_handler};
+ use crate::wire::{
+-    PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE,
+-    PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
++    PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_PROFILE_TIMER,
++    PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE,
++    PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
+ };
+ use crate::{free_slot_prog, BifrostGuest, BIFROST_TRACING_LINK_OPS};
+ 
+ extern "C" {
+     fn bpf_get_raw_tracepoint(name: *const c_char) -> *mut bindings::bpf_raw_event_map;
+     fn bpf_put_raw_tracepoint(btp: *mut bindings::bpf_raw_event_map);
++    fn perf_event_create_kernel_counter(
++        attr: *mut bindings::perf_event_attr,
++        cpu: c_int,
++        task: *mut bindings::task_struct,
++        callback: Option<unsafe extern "C" fn()>,
++        context: *mut c_void,
++    ) -> *mut bindings::perf_event;
++    fn perf_event_release_kernel(event: *mut bindings::perf_event) -> c_int;
++    fn perf_event_set_bpf_prog(
++        event: *mut bindings::perf_event,
++        prog: *mut bindings::bpf_prog,
++        bpf_cookie: u64,
++    ) -> c_int;
++    fn cpu_possible_mask() -> *const bindings::cpumask;
++    fn num_online_cpus() -> u32;
+     fn bpf_probe_register(
+         btp: *mut bindings::bpf_raw_event_map,
+         link: *mut bindings::bpf_raw_tp_link,
+@@ -135,6 +151,13 @@ pub(crate) unsafe fn slot_family_attach(
+                 ext.uprobe_symbol,
+                 bg,
+             ),
++            PROBE_TYPE_PROFILE_TIMER => attach_slot_profile_timer(
++                slot,
++                ext.uprobe_file_offset, // period_ns is carried in this slot
++                                        // by load_prog_parse; see
++                                        // `parse_profile_timer_trailer`.
++                bg,
++            ),
+             _ => {
+                 pr_err!(
+                     "bifrost_guest: unsupported probe_type {} for target='{}' slot[{}] — bifrost driver no longer dispatches kprobe (probe_types 0/1)\n",
+@@ -174,6 +197,10 @@ pub(crate) unsafe fn slot_family_cleanup(slot: usize, probe_type: u8) -> bool {
+             | PROBE_TYPE_UPROBE_BY_SYM
+             | PROBE_TYPE_URETPROBE_BY_SYM
+             | PROBE_TYPE_USDT => cleanup_slot_uprobe(slot),
++            PROBE_TYPE_PROFILE_TIMER => {
++                cleanup_slot_profile_timer(slot);
++                false
++            }
+             PROBE_TYPE_NONE => false,
+             other => {
+                 pr_err!(
+@@ -204,11 +231,113 @@ fn slot_family_label(probe_type: u8) -> &'static str {
+         PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => "uprobe",
+         PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => "uprobe_by_sym",
+         PROBE_TYPE_USDT => "usdt",
++        PROBE_TYPE_PROFILE_TIMER => "profile-timer",
+         PROBE_TYPE_NONE => "none",
+         _ => "unknown",
+     }
+ }
+ 
++/// Profile-timer attach (Track B P0 #6).  Opens a single per-CPU
++/// (CPU 0 for the MVP) `perf_event` of type PERF_TYPE_SOFTWARE
++/// (1) / PERF_COUNT_SW_CPU_CLOCK (0) with the host-supplied
++/// `period_ns` sample period, then attaches the JIT'd BPF program
++/// via `perf_event_set_bpf_prog`.  The event handle is stashed on
++/// the slot so cleanup can release it at detach.
++unsafe fn attach_slot_profile_timer(
++    slot: usize,
++    period_ns: u64,
++    bg: *mut BifrostGuest,
++) -> c_int {
++    unsafe {
++        let jitted = slots_mut()[slot].prog.load(Ordering::Acquire);
++        if jitted.is_null() {
++            pr_err!(
++                "bifrost_guest: profile-timer slot[{}]: prog pointer missing — verifier path failed?\n",
++                slot,
++            );
++            return -(bindings::EINVAL as i32);
++        }
++        if period_ns == 0 {
++            pr_err!(
++                "bifrost_guest: profile-timer slot[{}]: period_ns=0 rejected (host should encode at least 1ns)\n",
++                slot,
++            );
++            return -(bindings::EINVAL as i32);
++        }
++        let mut attr = bindings::perf_event_attr::default();
++        attr.type_ = 1; // PERF_TYPE_SOFTWARE
++        attr.size = core::mem::size_of::<bindings::perf_event_attr>() as u32;
++        attr.config = 0; // PERF_COUNT_SW_CPU_CLOCK
++        attr.__bindgen_anon_1.sample_period = period_ns;
++        // sample_type=0 keeps the perf-event sample record minimal; the BPF
++        // program reads its own context (bpf_perf_event_data) — no
++        // raw-sample payload needed.
++        attr.sample_type = 0;
++        // Open per-CPU 0 only for the MVP.  Per-CPU iteration is a
++        // follow-up; profile-timer on CPU 0 still fires at the
++        // requested period and feeds the same per-CPU SHM ring the
++        // tracepoint path uses.
++        let event = perf_event_create_kernel_counter(
++            &mut attr as *mut _,
++            0,                       // cpu = 0
++            core::ptr::null_mut(),   // task = NULL (CPU-bound)
++            None,                    // callback (NULL → BPF takes the sample)
++            core::ptr::null_mut(),   // context
++        );
++        if (event as usize) >= (-4095isize as usize) {
++            // ERR_PTR encoding: returned pointer is in the [-4095, 0)
++            // range when the kernel signalled a negative errno.
++            let err = -((event as isize) as i32);
++            pr_err!(
++                "bifrost_guest: profile-timer slot[{}] perf_event_create_kernel_counter failed: {}\n",
++                slot,
++                err,
++            );
++            return -err.abs();
++        }
++        let r = perf_event_set_bpf_prog(event, jitted, 0);
++        if r != 0 {
++            pr_err!(
++                "bifrost_guest: profile-timer slot[{}] perf_event_set_bpf_prog failed: {}\n",
++                slot,
++                r,
++            );
++            perf_event_release_kernel(event);
++            return r;
++        }
++        slots_mut()[slot].perf_event = event;
++        // Mirror attach_slot_fbt: bump the high-water-mark slot
++        // counter so subsequent LOAD_PROGs land in slot+1 instead
++        // of clobbering this one.  Without this, the peer
++        // ExtraProg::Action's per-fire program overwrites the
++        // profile-timer's agg-chain program at slot[0] (or vice
++        // versa), depending on LOAD_PROG order.
++        BIFROST_NUM_KPROBES = slot + 1;
++        (*bg).kprobe_attached = true;
++        pr_info!(
++            "bifrost_guest: profile-timer slot[{}] attached: period_ns={} cpu=0\n",
++            slot,
++            period_ns,
++        );
++        0
++    }
++}
++
++/// Counterpart to `attach_slot_profile_timer`.  Releases the
++/// per-CPU perf_event handle if one was registered.
++unsafe fn cleanup_slot_profile_timer(slot: usize) {
++    unsafe {
++        if slot >= slots_mut().len() {
++            return;
++        }
++        let event = slots_mut()[slot].perf_event;
++        if !event.is_null() {
++            let _ = perf_event_release_kernel(event);
++            slots_mut()[slot].perf_event = core::ptr::null_mut();
++        }
++    }
++}
++
+ /// On any error the JIT'd prog is freed and the slot stays
+ /// unattached (cleanup_slot_fbt then no-ops).
+ unsafe fn attach_slot_fbt(
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index 441b236ae7ab..50590ca107d9 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -109,7 +109,8 @@
+     SHMEM_VERSION, SHMEM_VMA_CACHE_LEN, SHMEM_VMA_CACHE_OFF,
+ };
+ use wire::{
+-    AGG_KIND_SUM, PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT,
++    AGG_KIND_SUM, PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_PROFILE_TIMER,
++    PROBE_TYPE_TRACEPOINT,
+ };
+ 
+ module! {
+@@ -988,6 +989,26 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                 }
+                             }
+ 
++                            // profile-timer probes (PROBE_TYPE_PROFILE_TIMER,
++                            // Track B P0 #6): the BPF program runs from a
++                            // perf_event sample callback, so route through
++                            // bifrost_set_prog_type(BPF_PROG_TYPE_PERF_EVENT)
++                            // before the verifier sees it.  No
++                            // attach_btf_id setup — perf-event programs
++                            // don't go through check_attach_btf_id either.
++                            if probe_type == PROBE_TYPE_PROFILE_TIMER
++                                && !(*prog).aux.is_null()
++                            {
++                                // BPF_PROG_TYPE_PERF_EVENT = 7.
++                                let r = bindings::bifrost_set_prog_type(prog, 7);
++                                if r != 0 {
++                                    pr_err!(
++                                        "bifrost_guest: bifrost_set_prog_type(PERF_EVENT) failed: {}\n",
++                                        r
++                                    );
++                                }
++                            }
++
+                             // Layer 2: hand the prog to the kernel verifier
+                             // before JIT. Verifier resolves pseudo-ldimm64
+                             // (real_fd → bpf_map*), validates instruction
+@@ -998,8 +1019,10 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                             let verr = bindings::bifrost_verify_prog(&mut prog_p);
+                             if verr != 0 {
+                                 pr_err!(
+-                                    "bifrost_guest: bifrost_verify_prog failed: {}\n",
+-                                    verr
++                                    "bifrost_guest: bifrost_verify_prog failed: {} (probe_type={}, prog.type={})\n",
++                                    verr,
++                                    probe_type,
++                                    (*prog_p).type_,
+                                 );
+                                 bpf_prog_free(prog_p);
+                                 for j in 0..(*bg).num_maps as usize {
+diff --git a/drivers/bifrost/load_prog_parse.rs b/drivers/bifrost/load_prog_parse.rs
+index 9135db1f5da4..797a1a6f4368 100644
+--- a/drivers/bifrost/load_prog_parse.rs
++++ b/drivers/bifrost/load_prog_parse.rs
+@@ -18,8 +18,8 @@
+     BPF_INSN_WIRE_SIZE, MAP_DEF_WIRE_SIZE,
+ };
+ use crate::wire::{
+-    PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM,
+-    PROBE_TYPE_USDT,
++    PROBE_TYPE_PROFILE_TIMER, PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE,
++    PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
+ };
+ 
+ /// Caps mirroring the historical inline scratch buffers. Bumping any of
+@@ -283,6 +283,22 @@ pub(crate) unsafe fn parse_load_prog(
+                 layout.uprobe_symbol_len = probe_len;
+                 off += probe_len;
+             }
++            PROBE_TYPE_PROFILE_TIMER => {
++                // Track B P0 #6: trailer is one u64 period_ns.  We
++                // stash it in `uprobe_file_offset` (the only u64
++                // scratch field on `layout` today) so the attach
++                // dispatch can pass it through `AttachExt` without
++                // a separate field.  See attach.rs's
++                // `attach_slot_profile_timer` for the consumer.
++                if !need(off, 8) {
++                    pr_err!(
++                        "bifrost_guest: LOAD_PROG profile-timer trailer truncated (need 8 bytes)\n"
++                    );
++                    return Err(-(bindings::EINVAL as i32));
++                }
++                layout.uprobe_file_offset = read_u64_le_unaligned(base.add(off));
++                off += 8;
++            }
+             _ => {}
+         }
+ 
+diff --git a/drivers/bifrost/slots.rs b/drivers/bifrost/slots.rs
+index 904d4b7668e3..e83a5257b5b0 100644
+--- a/drivers/bifrost/slots.rs
++++ b/drivers/bifrost/slots.rs
+@@ -70,6 +70,9 @@ pub(crate) struct BifrostSlot {
+     pub(crate) rawtp_btp: *mut bindings::bpf_raw_event_map,
+     /// True when rawtp_link is currently registered.
+     pub(crate) rawtp_registered: bool,
++    /// Profile-timer perf_event handle (one per-CPU; the MVP opens
++    /// CPU 0 only).  Null when no perf_event is registered.
++    pub(crate) perf_event: *mut bindings::perf_event,
+ }
+ 
+ impl BifrostSlot {
+@@ -91,6 +94,7 @@ const fn new() -> Self {
+             rawtp_link: core::mem::MaybeUninit::uninit(),
+             rawtp_btp: core::ptr::null_mut(),
+             rawtp_registered: false,
++            perf_event: core::ptr::null_mut(),
+         }
+     }
+ }
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index 1c8a8f66dfe2..7c4e93c7f9cf 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: 89e11231c6fd7b175f763cd72bbfe3d03beed7461420d0e10e64ce344593f284
++// CANONICAL_SHA256: b5678f968750b7b6fd4c20d75a0a6d703bbb0686b3b093480bd81c9dd903ee76
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -201,6 +201,28 @@
+ /// each gets its own registration.
+ pub const PROBE_TYPE_USDT: u8 = 9;
+ 
++/// Profile-timer attach.  The host emits `profile:::tick-Nms` /
++/// `profile:::tick-Nsec` clauses as a BPF_PROG_TYPE_PERF_EVENT
++/// program; the guest module opens one per-CPU
++/// `perf_event_create_kernel_counter` of type PERF_TYPE_SOFTWARE /
++/// PERF_COUNT_SW_CPU_CLOCK with `sample_period = period_ns`, and
++/// attaches the BPF program via the perf_event ioctl
++/// (`PERF_EVENT_IOC_SET_BPF`).  Trailer (after the 36-byte BFR7
++/// program header):
++///
++///   u64 period_ns
++///
++/// Track B P0 #6: needed for the one-shared-clause demo shape
++/// (`profile:::tick-100ms { @latency = quantize(...); }` routed to
++/// every kernel, no per-OS clause split).
++pub const PROBE_TYPE_PROFILE_TIMER: u8 = 10;
++// Marker so attach.rs's wildcard arm can name the new family in
++// its diagnostic and call into `attach_slot_profile_timer` once
++// the perf_event_create_kernel_counter binding lands.  See
++// load_prog_parse.rs for the period_ns trailer decode and
++// `bifrost_guest_attach_profile_timer` for the (to-land) attach.
++pub const PROBE_TYPE_PROFILE_TIMER_LABEL: &str = "profile-timer";
++
+ // =====================================================================
+ // Aggregation-kind discriminants.  Stored in the per-map flags
+ // byte; the guest's snapshot worker dispatches reduce-by-kind.
+@@ -227,6 +249,12 @@
+ /// (`factor`, `low_mag`, `high_mag`, `steps_per_mag`) live in
+ /// `xagg::LlquantizeParams`.
+ pub const AGG_KIND_LLQUANTIZE: u8 = 6;
++/// `quantize()` aggregation (power-of-two histogram).  Track B P0
++/// #7: map shape is `BPF_MAP_TYPE_PERCPU_ARRAY` with key=u32 0 and
++/// value=`DTRACE_QUANTIZE_NBUCKETS * sizeof(u64) = 1016` bytes.
++pub const AGG_KIND_QUANTIZE: u8 = 7;
++pub const DTRACE_QUANTIZE_NBUCKETS: usize = 127;
++pub const QUANTIZE_VALUE_SIZE: u32 = (DTRACE_QUANTIZE_NBUCKETS * 8) as u32;
+ 
+ // =====================================================================
+ // SHMEM record probe-id magics.  Stored at offset 4 of every
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 2dc6616facb2..079b5012d463 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -6175,6 +6175,60 @@ int bifrost_map_lookup_sum_u64(struct bpf_map *map, const void *key, u64 *out_su
+ }
+ EXPORT_SYMBOL_GPL(bifrost_map_lookup_sum_u64);
+ 
++/*
++ * Track B P0 #7: quantize-bucket-array reducer.  Mirrors
++ * bifrost_map_lookup_sum_u64 but per-bucket: each per-CPU value
++ * slot is an array of `n_buckets` u64s; we sum bucket-wise into
++ * `out_buckets[n_buckets]`.  Used by the Linux quantize agg
++ * snapshot writer to ship ONE row per (name, user-key) with the
++ * full bucket array as the value — same wire shape FreeBSD
++ * libdtrace emits for its quantize rows, so the cross-target
++ * reducer folds both kernels into one histogram cell.
++ */
++int bifrost_map_lookup_quantize_buckets(struct bpf_map *map,
++					const void *key,
++					u64 *out_buckets,
++					u32 n_buckets)
++{
++	void *val_ptr;
++	int cpu;
++	u32 i;
++	bool any = false;
++
++	if (!map || !map->ops || !out_buckets || !n_buckets)
++		return -EINVAL;
++	for (i = 0; i < n_buckets; i++)
++		out_buckets[i] = 0;
++
++	if (map->ops->map_lookup_percpu_elem) {
++		for_each_possible_cpu(cpu) {
++			const u64 *src;
++
++			val_ptr = map->ops->map_lookup_percpu_elem(
++				map, (void *)key, cpu);
++			if (!val_ptr)
++				continue;
++			src = (const u64 *)val_ptr;
++			for (i = 0; i < n_buckets; i++)
++				out_buckets[i] += src[i];
++			any = true;
++		}
++		return any ? 0 : -ENOENT;
++	}
++	if (!map->ops->map_lookup_elem)
++		return -EINVAL;
++	val_ptr = map->ops->map_lookup_elem(map, (void *)key);
++	if (!val_ptr)
++		return -ENOENT;
++	{
++		const u64 *src = (const u64 *)val_ptr;
++		for (i = 0; i < n_buckets; i++)
++			out_buckets[i] = src[i];
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(bifrost_map_lookup_quantize_buckets);
++
+ /*
+  * Per-cpu reduce shims for MIN/MAX/AVG aggregations. Same shape
+  * as bifrost_map_lookup_sum_u64 but reduce by min/max instead of
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index a1a91de45131..6a6c30e957d8 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -29,6 +29,8 @@
+ #include <linux/scatterlist.h>
+ #include <linux/uprobes.h>
+ #include <linux/namei.h>
++#include <linux/perf_event.h>
++#include <uapi/linux/perf_event.h>
+ 
+ /* Bifrost helper-proto resolver, defined in kernel/bpf/helpers.c.
+  * Exposed here so bindgen picks it up for the bifrost_guest module. */
+@@ -117,6 +119,13 @@ extern int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_k
+  * single u64; for non-percpu maps falls back to a single
+  * map_lookup_elem read. */
+ extern int bifrost_map_lookup_sum_u64(struct bpf_map *map, const void *key, unsigned long long *out_sum);
++/* Track B P0 #7: quantize-bucket-array reducer.  Per-cpu slot is
++ * `n_buckets * sizeof(u64)` bytes; sums bucket-wise across CPUs
++ * into `out_buckets[n_buckets]`. */
++extern int bifrost_map_lookup_quantize_buckets(struct bpf_map *map,
++					       const void *key,
++					       unsigned long long *out_buckets,
++					       unsigned int n_buckets);
+ /* MIN/MAX reduce across per-cpu slots. Treat per-cpu value 0 as
+  * sentinel for "this CPU never wrote" and skip it; -ENOENT if no
+  * CPU has a non-zero value. value_size must be 8.
+-- 
+2.50.1 (Apple Git-155)
+

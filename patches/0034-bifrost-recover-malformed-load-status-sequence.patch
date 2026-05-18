@@ -1,0 +1,41 @@
+From 9ff468dda179cdd33c75de6a5309cf6442cb9cc1 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Mon, 11 May 2026 19:47:45 -0700
+Subject: [PATCH] bifrost: recover malformed load status sequence
+
+---
+ drivers/bifrost/bifrost.rs | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index 36c08a5e5b4d..15510a50c243 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -1150,13 +1150,19 @@ unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
+ 
+ unsafe fn load_prog_seq(cmd: *const BifrostCmd, cmd_len: u32) -> u64 {
+     unsafe {
+-        if cmd.is_null() || (cmd_len as usize) < core::mem::size_of::<BifrostCmd>() {
+-            return 0;
+-        }
+-        let seq_off = core::mem::size_of::<BifrostCmd>() + (*cmd).len as usize;
+-        if (cmd_len as usize) < seq_off + core::mem::size_of::<u64>() {
++        const CMD_HDR: usize = core::mem::size_of::<BifrostCmd>();
++        const SEQ_LEN: usize = core::mem::size_of::<u64>();
++
++        if cmd.is_null() || (cmd_len as usize) < CMD_HDR + SEQ_LEN {
+             return 0;
+         }
++        let cmd_len = cmd_len as usize;
++        let declared_seq_off = CMD_HDR.saturating_add((*cmd).len as usize);
++        let seq_off = if declared_seq_off + SEQ_LEN <= cmd_len {
++            declared_seq_off
++        } else {
++            cmd_len - SEQ_LEN
++        };
+         core::ptr::read_unaligned((cmd as *const u8).add(seq_off) as *const u64)
+     }
+ }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,357 @@
+From bf55d17e4d47d9265aaa0c9af7525640e6b504e4 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Wed, 13 May 2026 12:24:27 -0700
+Subject: [PATCH] bifrost: stddev aggregation via per-CPU [n, sum, sum_sq]
+ triple
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+W5 partial — stddev() aggregation. The kernel-side reducer
+returns the (n, sum, sum_sq) triple; the host renderer computes
+sqrt((sum_sq * n - sum²) / (n * (n-1))) at render time. SHMEM
+ringbuf wire format extends the per-row agg-snapshot entry shape
+from
+    i32 fd, u32 k_size, k[k_size], u64 v
+to
+    i32 fd, u32 k_size, k[k_size], u32 v_size, v[v_size]
+so stddev can ship 24-byte (n, sum, sum_sq) triples alongside the
+8-byte sum/min/max/avg values. No backward compatibility with V3
+hosts (per project directive).
+
+Adds:
+
+- kernel/bpf/syscall.c: bifrost_map_lookup_stddev_u64(map, key,
+  *out_n, *out_sum, *out_sum_sq). Sums all three across CPUs
+  (value_size=24, [n][sum][sum_sq]). Mirrors avg's structure
+  with one extra slot.
+- rust/bindings/bindings_helper.h: extern declaration.
+- drivers/bifrost/wire.rs: AGG_KIND_STDDEV = 4. Canonical SHA
+  pin refreshed.
+- drivers/bifrost/agg_snapshot.rs: per-row v_size field;
+  STDDEV maps invoke the new reducer and write 24-byte values
+  (n, sum, sum_sq); other agg kinds keep writing 8 bytes.
+
+lquantize / llquantize / clear / normalize / trunc remain on
+the W5 follow-on punch list in docs/dtrace-roadmap.md.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/bifrost/agg_snapshot.rs | 140 +++++++++++++++++++++-----------
+ drivers/bifrost/wire.rs         |   8 +-
+ kernel/bpf/syscall.c            |  64 +++++++++++++++
+ rust/bindings/bindings_helper.h |   9 ++
+ 4 files changed, 171 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/bifrost/agg_snapshot.rs b/drivers/bifrost/agg_snapshot.rs
+index cbf0ad667eea..8a6fb458f7c2 100644
+--- a/drivers/bifrost/agg_snapshot.rs
++++ b/drivers/bifrost/agg_snapshot.rs
+@@ -6,7 +6,9 @@
+ 
+ use crate::bpf_consts::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF};
+ use crate::record_writer::RecordWriter;
+-use crate::wire::{AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_SNAPSHOT_PROBE_ID};
++use crate::wire::{
++    AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_KIND_STDDEV, AGG_SNAPSHOT_PROBE_ID,
++};
+ use crate::{BifrostGuest, BIFROST_MAP_AGG_KIND, BIFROST_MAP_FAKE_FDS};
+ 
+ /// Pack a snapshot of every non-RINGBUF map's live entries into the
+@@ -17,8 +19,16 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+         const HDR_BYTES: usize = 24;
+         const NUM_ENTRIES_BYTES: usize = 4;
+         const MAX_KEY_BYTES: usize = 32;
+-        const MAX_ENTRY_BYTES: usize = 4 + 4 + MAX_KEY_BYTES + 8;
+-        const MAX_ENTRIES: usize = 1024;
++        // W5: per-row v_size header (u32) plus payload up to 24
++        // bytes (STDDEV triple) — sum/min/max/avg use 8.
++        const MAX_VAL_BYTES: usize = 24;
++        const MAX_ENTRY_BYTES: usize = 4 + 4 + MAX_KEY_BYTES + 4 + MAX_VAL_BYTES;
++        // BIFROST_RB_MAX_RECORD is 65 536; subtract the snapshot
++        // header + entry-count u32 (28 bytes) and divide by the
++        // worst-case per-row size (68 bytes after the W5
++        // v_size + 24-byte STDDEV value extension) → 963 entries
++        // per snapshot. Round down to 960 for a clean number.
++        const MAX_ENTRIES: usize = 960;
+         const MAX_BODY: usize = HDR_BYTES + NUM_ENTRIES_BYTES + MAX_ENTRIES * MAX_ENTRY_BYTES;
+ 
+         let rec = bindings::bifrost_shmem_reserve_kernel(MAX_BODY as u32) as *mut u8;
+@@ -35,7 +45,66 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+         let n_off = writer.off;
+         writer.write_u32(0);
+ 
++        // Helper: pack one (fd, key, value) row into the writer.
++        // Returns true on success, false on out-of-space (caller
++        // rolls back). STDDEV writes 24 bytes, others 8.
+         let mut packed: usize = 0;
++        let mut pack_row = |writer: &mut RecordWriter,
++                            fd: i32,
++                            agg_kind: u8,
++                            map: *mut bindings::bpf_map,
++                            k_ptr: *const core::ffi::c_void,
++                            k_size: u32,
++                            k_bytes: &[u8]|
++         -> bool {
++            let chk = writer.off;
++            let ok = match agg_kind {
++                AGG_KIND_STDDEV => {
++                    let mut n: u64 = 0;
++                    let mut sum: u64 = 0;
++                    let mut sum_sq: u64 = 0;
++                    let rc = bindings::bifrost_map_lookup_stddev_u64(
++                        map,
++                        k_ptr,
++                        &mut n as *mut u64,
++                        &mut sum as *mut u64,
++                        &mut sum_sq as *mut u64,
++                    );
++                    if rc != 0 || n == 0 {
++                        return false;
++                    }
++                    writer.write_i32(fd)
++                        && writer.write_u32(k_size)
++                        && writer.write_bytes(k_bytes)
++                        && writer.write_u32(24)
++                        && writer.write_u64(n)
++                        && writer.write_u64(sum)
++                        && writer.write_u64(sum_sq)
++                }
++                _ => {
++                    let mut v: u64 = 0;
++                    let rc = match agg_kind {
++                        AGG_KIND_MIN => bindings::bifrost_map_lookup_min_u64(map, k_ptr, &mut v),
++                        AGG_KIND_MAX => bindings::bifrost_map_lookup_max_u64(map, k_ptr, &mut v),
++                        AGG_KIND_AVG => bindings::bifrost_map_lookup_avg_u64(map, k_ptr, &mut v),
++                        _ => bindings::bifrost_map_lookup_sum_u64(map, k_ptr, &mut v),
++                    };
++                    if rc != 0 || v == 0 {
++                        return false;
++                    }
++                    writer.write_i32(fd)
++                        && writer.write_u32(k_size)
++                        && writer.write_bytes(k_bytes)
++                        && writer.write_u32(8)
++                        && writer.write_u64(v)
++                }
++            };
++            if !ok {
++                writer.off = chk;
++            }
++            ok
++        };
++
+         for i in 0..(*bg).num_maps as usize {
+             if packed >= MAX_ENTRIES {
+                 break;
+@@ -52,15 +121,6 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+             }
+             let key_size = (*map).key_size as usize;
+ 
+-            let reduce = |k_ptr: *const core::ffi::c_void, out: *mut u64| -> i32 {
+-                match agg_kind {
+-                    AGG_KIND_MIN => bindings::bifrost_map_lookup_min_u64(map, k_ptr, out),
+-                    AGG_KIND_MAX => bindings::bifrost_map_lookup_max_u64(map, k_ptr, out),
+-                    AGG_KIND_AVG => bindings::bifrost_map_lookup_avg_u64(map, k_ptr, out),
+-                    _ => bindings::bifrost_map_lookup_sum_u64(map, k_ptr, out),
+-                }
+-            };
+-
+             if mt == BPF_MAP_TYPE_ARRAY || mt == BPF_MAP_TYPE_PERCPU_ARRAY {
+                 let max = (*map).max_entries;
+                 for k in 0..max {
+@@ -68,25 +128,18 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+                         break;
+                     }
+                     let k32: u32 = k;
+-                    let mut v: u64 = 0;
+-                    let rc = reduce(
+-                        &k32 as *const u32 as *const core::ffi::c_void,
+-                        &mut v as *mut u64,
+-                    );
+-                    if rc != 0 || v == 0 {
+-                        continue;
+-                    }
+-                    let chk = writer.off;
+                     let k_bytes = k32.to_le_bytes();
+-                    if !writer.write_i32(fd)
+-                        || !writer.write_u32(4)
+-                        || !writer.write_bytes(&k_bytes)
+-                        || !writer.write_u64(v)
+-                    {
+-                        writer.off = chk;
+-                        break;
++                    if pack_row(
++                        &mut writer,
++                        fd,
++                        agg_kind,
++                        map,
++                        &k32 as *const u32 as *const core::ffi::c_void,
++                        4,
++                        &k_bytes,
++                    ) {
++                        packed += 1;
+                     }
+-                    packed += 1;
+                 }
+             } else {
+                 let mut cur_key = [0u8; 32];
+@@ -109,27 +162,16 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+                     if rc != 0 {
+                         break;
+                     }
+-                    let mut v: u64 = 0;
+-                    let rc_lookup = reduce(
++                    let kb = core::cmp::min(key_size, MAX_KEY_BYTES);
++                    if pack_row(
++                        &mut writer,
++                        fd,
++                        agg_kind,
++                        map,
+                         next_key.as_ptr() as *const core::ffi::c_void,
+-                        &mut v as *mut u64,
+-                    );
+-                    if rc_lookup != 0 {
+-                        cur_key.copy_from_slice(&next_key);
+-                        have_cur = true;
+-                        continue;
+-                    }
+-                    if v != 0 {
+-                        let kb = core::cmp::min(key_size, MAX_KEY_BYTES);
+-                        let chk = writer.off;
+-                        if !writer.write_i32(fd)
+-                            || !writer.write_u32(kb as u32)
+-                            || !writer.write_bytes(&next_key[..kb])
+-                            || !writer.write_u64(v)
+-                        {
+-                            writer.off = chk;
+-                            break;
+-                        }
++                        kb as u32,
++                        &next_key[..kb],
++                    ) {
+                         packed += 1;
+                     }
+                     cur_key.copy_from_slice(&next_key);
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index ebafa6682c0a..71a6302b3ce8 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: 4549cfc92f0cf601db5d4faf507548695783b5a286b7d2b91f16561c25938cb7
++// CANONICAL_SHA256: 298055b368127bfb5a724afdb27abc55e0f0aff91d8c881dfda7df630010125e
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -148,6 +148,12 @@
+ pub const AGG_KIND_MIN: u8 = 1;
+ pub const AGG_KIND_MAX: u8 = 2;
+ pub const AGG_KIND_AVG: u8 = 3;
++/// `stddev()` aggregation. Per-CPU slot is
++/// `[n:u64][sum:u64][sum_of_squares:u64]` (value_size = 24);
++/// snapshot rows carry the full 24 bytes so the host xagg
++/// renderer can compute
++/// `sqrt((sum_sq * n - sum*sum) / (n * (n-1)))` at render time.
++pub const AGG_KIND_STDDEV: u8 = 4;
+ 
+ // =====================================================================
+ // SHMEM record probe-id magics.  Stored at offset 4 of every
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 00bcf58fdc60..2dc6616facb2 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -6310,6 +6310,70 @@ int bifrost_map_lookup_avg_u64(struct bpf_map *map, const void *key, u64 *out_av
+ }
+ EXPORT_SYMBOL_GPL(bifrost_map_lookup_avg_u64);
+ 
++/*
++ * W5 (DTrace stddev): reduce a per-cpu map's 24-byte slots
++ * (`{n, sum, sum_of_squares}`) into three host-visible
++ * counters. The host computes the actual standard deviation
++ * from the triple via the population-variance formula
++ *
++ *     stddev = sqrt((sum_sq * n - sum*sum) / (n * (n-1)))
++ *
++ * at xagg-render time — keeping the kernel-side reduction to
++ * straight integer adds (no sqrt) keeps the BPF program shape
++ * the same as count/sum/avg.
++ *
++ * Returns -EINVAL on bad args, -ENOENT if no CPU has a sample,
++ * 0 on success.
++ */
++int bifrost_map_lookup_stddev_u64(struct bpf_map *map, const void *key,
++				  u64 *out_n, u64 *out_sum, u64 *out_sum_sq)
++{
++	void *val_ptr;
++	int cpu;
++
++	if (!map || !map->ops || !out_n || !out_sum || !out_sum_sq)
++		return -EINVAL;
++	if (map->value_size < 24)
++		return -EINVAL;
++
++	if (map->ops->map_lookup_percpu_elem) {
++		u64 n = 0, sum = 0, sum_sq = 0;
++		for_each_possible_cpu(cpu) {
++			val_ptr = map->ops->map_lookup_percpu_elem(
++				map, (void *)key, cpu);
++			if (val_ptr) {
++				n      += ((u64 *)val_ptr)[0];
++				sum    += ((u64 *)val_ptr)[1];
++				sum_sq += ((u64 *)val_ptr)[2];
++			}
++		}
++		if (n == 0)
++			return -ENOENT;
++		*out_n      = n;
++		*out_sum    = sum;
++		*out_sum_sq = sum_sq;
++		return 0;
++	}
++
++	if (!map->ops->map_lookup_elem)
++		return -EINVAL;
++	val_ptr = map->ops->map_lookup_elem(map, (void *)key);
++	if (!val_ptr)
++		return -ENOENT;
++	{
++		u64 n      = ((u64 *)val_ptr)[0];
++		u64 sum    = ((u64 *)val_ptr)[1];
++		u64 sum_sq = ((u64 *)val_ptr)[2];
++		if (n == 0)
++			return -ENOENT;
++		*out_n      = n;
++		*out_sum    = sum;
++		*out_sum_sq = sum_sq;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(bifrost_map_lookup_stddev_u64);
++
+ /*
+  * Bifrost verifier shim. Runs the standard kernel BPF verifier
+  * against a pre-loaded bpf_prog using `bpf_check`, with output
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index 3293c12c296c..c7e7096f8ac5 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -120,6 +120,15 @@ extern int bifrost_map_lookup_max_u64(struct bpf_map *map, const void *key, unsi
+  * across CPUs, returns sum/count. -ENOENT if total count is 0.
+  */
+ extern int bifrost_map_lookup_avg_u64(struct bpf_map *map, const void *key, unsigned long long *out_avg);
++/* STDDEV: per-cpu slot is [n:u64][sum:u64][sum_of_squares:u64]
++ * (value_size=24). Sums all three across CPUs, returns the
++ * triple to the host so xagg can compute
++ * sqrt((sum_sq * n - sum*sum) / (n * (n-1))). -ENOENT if total
++ * n is 0. */
++extern int bifrost_map_lookup_stddev_u64(struct bpf_map *map, const void *key,
++					 unsigned long long *out_n,
++					 unsigned long long *out_sum,
++					 unsigned long long *out_sum_sq);
+ /* Bifrost verifier shim — runs the standard kernel BPF verifier
+  * via bpf_check, with verbose output to dmesg via BPF_LOG_KERNEL.
+  * Caller must (a) bpf_prog_alloc + set type/len + copy insns,
+-- 
+2.50.1 (Apple Git-155)
+

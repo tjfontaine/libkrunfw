@@ -1,0 +1,38 @@
+From 80586be2d56d290679c8b87054dafad88d41bfe6 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Fri, 15 May 2026 21:46:21 -0700
+Subject: bifrost: bind a stock QEMU virtio id for the vhost-user conduit
+
+---
+ drivers/bifrost/bifrost.rs | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index ddfbe8da5069..441b236ae7ab 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -1513,11 +1513,20 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
+     }
+ }
+ 
+-static mut ID_TABLE: [bindings::virtio_device_id; 2] = [
++static mut ID_TABLE: [bindings::virtio_device_id; 3] = [
+     bindings::virtio_device_id {
+         device: 42,
+         vendor: bindings::VIRTIO_DEV_ANY_ID,
+     },
++    // QEMU's stock vhost-user-test-device validates the virtio ID through
++    // its built-in virtio_id_to_name() table before the backend ever sees the
++    // device. Bind a QEMU-known generic ID for that path so Bifrost stays a
++    // guest/backend change instead of a QEMU patch. This kernel config does
++    // not enable a competing virtio-spi driver.
++    bindings::virtio_device_id {
++        device: 45,
++        vendor: bindings::VIRTIO_DEV_ANY_ID,
++    },
+     bindings::virtio_device_id {
+         device: 0,
+         vendor: 0,
+-- 
+2.50.1 (Apple Git-155)
+

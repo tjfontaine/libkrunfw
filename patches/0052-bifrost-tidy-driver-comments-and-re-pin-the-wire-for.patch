@@ -1,0 +1,482 @@
+From d2f0d3a5955bb1075858a5b9ce4b68d443126b66 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Sun, 17 May 2026 21:34:07 -0700
+Subject: bifrost: tidy driver comments and re-pin the wire-format hash
+
+Editorial pass over the driver comments: name capabilities and
+protocol stages by what they do rather than by internal milestone
+labels, and update the CANONICAL_SHA256 pin in the vendored wire.rs
+to track the canonical host/bifrost-wire source.
+---
+ drivers/bifrost/agg_snapshot.rs    |  4 +--
+ drivers/bifrost/attach.rs          | 10 +++---
+ drivers/bifrost/bifrost.rs         | 32 +++++++++---------
+ drivers/bifrost/bifrost_helpers.c  |  2 +-
+ drivers/bifrost/kfunc_manifest.rs  |  6 ++--
+ drivers/bifrost/load_prog_parse.rs |  2 +-
+ drivers/bifrost/slots.rs           |  2 +-
+ drivers/bifrost/wire.rs            | 54 +++++++++++++++---------------
+ 8 files changed, 56 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/bifrost/agg_snapshot.rs b/drivers/bifrost/agg_snapshot.rs
+index eb4544102243..a860e6efd07a 100644
+--- a/drivers/bifrost/agg_snapshot.rs
++++ b/drivers/bifrost/agg_snapshot.rs
+@@ -121,7 +121,7 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+             let kind = agg_snapshot_row_kind(agg_kind);
+             let ok = match agg_kind {
+                 AGG_KIND_QUANTIZE => {
+-                    // Track B P0 #7: walk the per-CPU
++                    // Walk the per-CPU
+                     // QUANTIZE_VALUE_SIZE byte bucket array, sum
+                     // bucket-wise across CPUs, and emit ONE row
+                     // with the full array as the value.  Matches
+@@ -229,7 +229,7 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+                     }
+                     let k32: u32 = k;
+                     let k_bytes = k32.to_le_bytes();
+-                    // Track B P0 #7: AGG_KIND_QUANTIZE on a
++                    // AGG_KIND_QUANTIZE on a
+                     // PERCPU_ARRAY[1] represents an unkeyed
+                     // `@latency = quantize(...)`.  The map index
+                     // 0 is an internal lookup detail, not a
+diff --git a/drivers/bifrost/attach.rs b/drivers/bifrost/attach.rs
+index dd028e42da47..0b80ed357d5b 100644
+--- a/drivers/bifrost/attach.rs
++++ b/drivers/bifrost/attach.rs
+@@ -222,7 +222,7 @@ pub(crate) unsafe fn slot_family_cleanup(slot: usize, probe_type: u8) -> bool {
+ }
+ 
+ /// Short string label for the family that owns `probe_type`.
+-/// Used by Phase H emit in a follow-up; today only diagnostic.
++/// Used by self-trace emit in a follow-up; today only diagnostic.
+ #[allow(dead_code)]
+ fn slot_family_label(probe_type: u8) -> &'static str {
+     match probe_type {
+@@ -237,7 +237,7 @@ fn slot_family_label(probe_type: u8) -> &'static str {
+     }
+ }
+ 
+-/// Profile-timer attach (Track B P0 #6).  Opens a single per-CPU
++/// Profile-timer attach.  Opens a single per-CPU
+ /// (CPU 0 for the MVP) `perf_event` of type PERF_TYPE_SOFTWARE
+ /// (1) / PERF_COUNT_SW_CPU_CLOCK (0) with the host-supplied
+ /// `period_ns` sample period, then attaches the JIT'd BPF program
+@@ -547,7 +547,7 @@ unsafe fn attach_slot_uprobe_by_sym(
+             );
+             return -(bindings::EINVAL as i32);
+         }
+-        // Goal item 6: TaskRef pairs the C-side get_task_struct with a
++        // TaskRef pairs the C-side get_task_struct with a
+         // mechanical put_task_struct on drop. Replaces the manual
+         // put_task_ref calls that were scattered across each early
+         // return.
+@@ -781,7 +781,7 @@ unsafe fn attach_slot_usdt(
+             }
+             (None, pinned)
+         } else {
+-            // Goal item 6: TaskRef RAII pairs get_task_struct on the C
++            // TaskRef RAII pairs get_task_struct on the C
+             // side with put_task_struct on drop.
+             let Some(task_ref) = TaskRef::find(basename) else {
+                 pr_err!(
+@@ -937,7 +937,7 @@ unsafe fn attach_slot_uprobe(
+         let mut resolved_via = "<unset>";
+ 
+         // Stage 1: exe_file via for_each_process.
+-        // Goal item 6: TaskRef releases the task ref on drop, even
++        // TaskRef releases the task ref on drop, even
+         // through the early-break branches inside the chain below.
+         let basename = path_basename(uprobe_path_buf);
+         if !basename.is_empty() {
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index 32aa13d01848..59d8af53dc23 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -261,7 +261,7 @@ unsafe fn map_bifrost_virtio_shmem(vdev: *mut bindings::virtio_device) -> *mut u
+ /// release them after verification — the prog holds its own ref.
+ static mut BIFROST_MAP_REAL_FDS: [i32; 8] = [-1; 8];
+ 
+-// Bypass-verifier path retired (Phase L, goal item 5). Every LOAD_PROG
++// Bypass-verifier path retired. Every LOAD_PROG
+ // routes through `bifrost_verify_prog` against the standard kernel BPF
+ // verifier — no toggle, no module_param. The historical AtomicBool flag
+ // and its `__bpf_call_base + offset` patch arm are gone; the kernel
+@@ -273,7 +273,7 @@ unsafe fn map_bifrost_virtio_shmem(vdev: *mut bindings::virtio_device) -> *mut u
+ // manual `aux->stack_depth = 512` set (bpf_check computes the real
+ // frame size).
+ 
+-/// SINGLETON DEVICE INVARIANT (goal item 10).
++/// SINGLETON DEVICE INVARIANT.
+ ///
+ /// The bifrost helper surface — `bifrost_shmem_va`/`bifrost_shmem_len`,
+ /// `bifrost_kick_fn`/`bifrost_kick_priv` in kernel/bpf/helpers.c, plus
+@@ -698,7 +698,7 @@ fn parse_tick_period_ns(bytes: &[u8]) -> Option<u64> {
+ 
+ // RecordWriter moved to drivers/bifrost/record_writer.rs.
+ 
+-// `bifrost_get_stack` shim retired (Phase L, goal item 5). With the
++// `bifrost_get_stack` shim retired. With the
+ // bypass-verifier path gone, helper id 67 resolves to the kernel's real
+ // `bpf_get_stack_proto` via `kprobe_prog_func_proto` during bpf_check.
+ // That path handles BPF_F_USER_STACK and kprobe/kretprobe context
+@@ -715,8 +715,8 @@ fn parse_tick_period_ns(bytes: &[u8]) -> Option<u64> {
+ #[inline(always)]
+ pub(crate) unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
+     unsafe {
+-        // Bounds-check against the slot-table length.  Post-Phase-L
+-        // (goal item 4) the table is pre-allocated full at module
++        // Bounds-check against the slot-table length.  The
++        // table is pre-allocated full at module
+         // init and never reallocated, so the slice header observed
+         // from IRQ context is stable.  This check is defense in
+         // depth against a stale or out-of-bounds slot index arriving
+@@ -845,7 +845,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+ 	                if (*bg).cmd_len >= core::mem::size_of::<BifrostCmd>() as u32 {
+ 	                    if (*cmd).op == 3 {
+ 	                        // BifrostCmd.op == 3 — DTRACE_SESSION envelope
+-	                        // (post-cutover; see goal.md + the
++	                        // (post-cutover; see the
+ 	                        // BIFROST_CMD_OP_DTRACE_SESSION host doc).
+ 	                        // Body: BifrostCmd hdr + 96-byte
+ 	                        // DTRACE_SESSION_V1 + DOF.  This stub
+@@ -1217,7 +1217,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                         // Single path: rewrite LD_IMM64 fake_fd→real_fd for
+                         // every map reference; leave BPF_CALL alone (the
+                         // verifier resolves helper ids during bpf_check).
+-                        // The bypass-verifier path retired (goal item 5).
++                        // The bypass-verifier path retired.
+                         let mut idx = 0u32;
+                         while idx < num_insns {
+                             let insn = BpfInsn::read_le_unaligned(insn_at(idx));
+@@ -1394,14 +1394,14 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+ 
+                         // --- Phase 4: Allocate bpf_prog and JIT into slot N ---
+                         let slot = BIFROST_NUM_KPROBES;
+-                        // Phase C heap migration: grow the slot
++                        // Heap migration: grow the slot
+                         // table on demand instead of bouncing off
+                         // a hard MAX_KPROBES cap.  Allocation
+                         // failure (kmalloc returns -ENOMEM) re-arms
+                         // ctrl_buf with status=-1 — the host CLI's
+                         // existing per-program status path will
+                         // surface this as RSP_LOADPROG_STATUS_OTHER
+-                        // when wired through Phase B step 3.
++                        // when wired through the BTF resolution step.
+                         if let Err(e) = slots_ensure(slot + 1) {
+                             pr_err!(
+                                 "bifrost_guest: slot {} exceeds pre-allocated MAX_PROBE_SLOTS table ({:?}); dropping LOAD_PROG\n",
+@@ -1530,8 +1530,8 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                 }
+                             }
+ 
+-                            // profile-timer probes (PROBE_TYPE_PROFILE_TIMER,
+-                            // Track B P0 #6): the BPF program runs from a
++                            // profile-timer probes (PROBE_TYPE_PROFILE_TIMER):
++                            // the BPF program runs from a
+                             // perf_event sample callback, so route through
+                             // bifrost_set_prog_type(BPF_PROG_TYPE_PERF_EVENT)
+                             // before the verifier sees it.  No
+@@ -1639,10 +1639,10 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                             let name_slice = &target_name[..nul];
+                             let name_str = core::str::from_utf8(name_slice).unwrap_or("?");
+ 
+-                            // Phase D: single dispatch site collapses
++                            // Single dispatch site collapses
+                             // the five-arm match into one helper.  The
+                             // helper also issues a fresh slot lease
+-                            // (Phase C step 2 kernel-side) before
++                            // (the kernel-side heap migration) before
+                             // dispatching to the family-specific
+                             // attach.
+                             let ext = AttachExt {
+@@ -1967,7 +1967,7 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
+     unsafe {
+         let bg = (*vdev).priv_ as *mut BifrostGuest;
+ 
+-        // Goal item 7: teardown ordering.  The contract is that no
++        // Teardown ordering.  The contract is that no
+         // freed memory can be observed by an in-flight BPF program
+         // or kfunc reader.  We achieve this with a strict sequence:
+         //
+@@ -1999,7 +1999,7 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
+ 
+         // Step 2: unregister probes + drain handlers.
+         if (*bg).kprobe_attached {
+-            // Phase D: single cleanup dispatch.  USDT shares the
++            // Single cleanup dispatch.  USDT shares the
+             // uprobe storage with the by-sym and host-resolved
+             // variants; slot_family_cleanup returns true for any
+             // uprobe-family slot so the caller can run the
+@@ -2103,7 +2103,7 @@ impl kernel::Module for BifrostGuestModule {
+     fn init(_module: &'static kernel::ThisModule) -> Result<Self> {
+         pr_info!("bifrost_guest: Rust module initialized\n");
+         kfunc_manifest::validate()?;
+-        // Phase L (goal item 4): allocate the slot table full at module
++        // Allocate the slot table full at module
+         // load.  The KVec is never resized past init, so the slice
+         // header that IRQ-context uprobe handlers index against is
+         // stable.  ~80 KB kmalloc; OOM here aborts module load with an
+diff --git a/drivers/bifrost/bifrost_helpers.c b/drivers/bifrost/bifrost_helpers.c
+index 532833bd0c6b..174e4090f5f2 100644
+--- a/drivers/bifrost/bifrost_helpers.c
++++ b/drivers/bifrost/bifrost_helpers.c
+@@ -1129,7 +1129,7 @@ void bifrost_helper_for_each_vma_file(struct task_struct *task,
+ EXPORT_SYMBOL_GPL(bifrost_helper_for_each_vma_file);
+ 
+ /*
+- * Phase K — kfunc manifest.  Names and canonical C signatures of
++ * kfunc manifest.  Names and canonical C signatures of
+  * every bifrost_helper_* exported from this file, in the same order
+  * that the Rust extern decls appear in drivers/bifrost/bifrost.rs.
+  *
+diff --git a/drivers/bifrost/kfunc_manifest.rs b/drivers/bifrost/kfunc_manifest.rs
+index a0385ce711c9..f0a52696f1a5 100644
+--- a/drivers/bifrost/kfunc_manifest.rs
++++ b/drivers/bifrost/kfunc_manifest.rs
+@@ -4,7 +4,7 @@
+ use kernel::bindings;
+ use kernel::prelude::*;
+ 
+-// Phase K — kfunc manifest expected on the C side.  Each entry is
++// kfunc manifest expected on the C side.  Each entry is
+ // (name, canonical_signature_string).  bifrost_helpers.c carries the
+ // identical list as `BIFROST_KFUNC_MANIFEST`; module init validates
+ // they match by computing the same djb2 hash on both sides.
+@@ -55,7 +55,7 @@ struct KfuncDecl {
+ const BIFROST_KFUNC_EXPECTED_LEN: u32 = BIFROST_KFUNC_EXPECTED.len() as u32;
+ 
+ extern "C" {
+-    /// Phase K — manifest hash exported by bifrost_helpers.c.  Mismatch
++    /// Manifest hash exported by bifrost_helpers.c.  Mismatch
+     /// vs `BIFROST_KFUNC_EXPECTED_HASH` ⇒ Rust extern decls disagree
+     /// with the live C signatures; refuse module load.
+     fn bifrost_kfunc_manifest_hash() -> u32;
+@@ -66,7 +66,7 @@ struct KfuncDecl {
+ }
+ 
+ pub(crate) fn validate() -> Result<()> {
+-    // Phase K — kfunc manifest validation.  Refuses to load if
++    // kfunc manifest validation.  Refuses to load if
+     // bifrost_helpers.c's exported manifest disagrees with the
+     // Rust extern decls' expected manifest.  Two checks: array
+     // length first (clearer diagnostic on add/remove drift),
+diff --git a/drivers/bifrost/load_prog_parse.rs b/drivers/bifrost/load_prog_parse.rs
+index 797a1a6f4368..92914b65fe4f 100644
+--- a/drivers/bifrost/load_prog_parse.rs
++++ b/drivers/bifrost/load_prog_parse.rs
+@@ -284,7 +284,7 @@ pub(crate) unsafe fn parse_load_prog(
+                 off += probe_len;
+             }
+             PROBE_TYPE_PROFILE_TIMER => {
+-                // Track B P0 #6: trailer is one u64 period_ns.  We
++                // Trailer is one u64 period_ns.  We
+                 // stash it in `uprobe_file_offset` (the only u64
+                 // scratch field on `layout` today) so the attach
+                 // dispatch can pass it through `AttachExt` without
+diff --git a/drivers/bifrost/slots.rs b/drivers/bifrost/slots.rs
+index e83a5257b5b0..be9333cf12a0 100644
+--- a/drivers/bifrost/slots.rs
++++ b/drivers/bifrost/slots.rs
+@@ -10,7 +10,7 @@
+ 
+ /// Slot-table capacity allocated at module init.
+ ///
+-/// **Phase L (goal item 4)**: the slot table is now allocated full at
++/// The slot table is now allocated full at
+ /// init time rather than growing on demand.  `KVec<KBox<BifrostSlot>>`
+ /// remains the underlying storage, but `KVec::push` is no longer
+ /// called past `bifrost_slots_init()`.  This closes the IRQ-vs-worker
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index 16c0200e93c3..dbd73cd7a706 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: 4d350fac9e8caef4abe1edf5c9e8648f006d92e9a4f29861f815cefcda7de6da
++// CANONICAL_SHA256: ca5f1a2c1f7fe51da32efebf2a2eaabdfa3aeebcd55477f35b1e0ab3918d67d8
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -172,7 +172,7 @@
+ pub const PROBE_TYPE_TRACEPOINT: u8 = 8;
+ /// Soft cap on the number of probe slots the driver can register
+ /// concurrently.  The driver's slot table is now a heap-allocated
+-/// `KVec<BifrostSlot>` (Phase C heap migration); this constant is
++/// `KVec<BifrostSlot>` (the heap-allocated slot table); this constant is
+ /// the initial capacity sized at module load.  Mirrors
+ /// `SLOT_CAPACITY` in
+ /// `third_party/linux-bifrost/drivers/bifrost/bifrost.rs`.
+@@ -212,7 +212,7 @@
+ ///
+ ///   u64 period_ns
+ ///
+-/// Track B P0 #6: needed for the one-shared-clause demo shape
++/// Needed for the one-shared-clause demo shape
+ /// (`profile:::tick-100ms { @latency = quantize(...); }` routed to
+ /// every kernel, no per-OS clause split).
+ pub const PROBE_TYPE_PROFILE_TIMER: u8 = 10;
+@@ -249,8 +249,8 @@
+ /// (`factor`, `low_mag`, `high_mag`, `steps_per_mag`) live in
+ /// `xagg::LlquantizeParams`.
+ pub const AGG_KIND_LLQUANTIZE: u8 = 6;
+-/// `quantize()` aggregation (power-of-two histogram).  Track B P0
+-/// #7: map shape is `BPF_MAP_TYPE_PERCPU_ARRAY` with key=u32 0 and
++/// `quantize()` aggregation (power-of-two histogram).
++/// Map shape is `BPF_MAP_TYPE_PERCPU_ARRAY` with key=u32 0 and
+ /// value=`DTRACE_QUANTIZE_NBUCKETS * sizeof(u64) = 1016` bytes.
+ pub const AGG_KIND_QUANTIZE: u8 = 7;
+ pub const DTRACE_QUANTIZE_NBUCKETS: usize = 127;
+@@ -352,7 +352,7 @@
+ pub const SELF_TRACE_LIBKRUN_PROBE_ID: u32 = 0xFFFFFFFA;
+ /// Self-trace event from the host CLI.
+ pub const SELF_TRACE_CLI_PROBE_ID: u32 = 0xFFFFFFF9;
+-/// Profile-N sampling probe (Phase M).  Records carry a periodic
++/// Profile-N sampling probe.  Records carry a periodic
+ /// stack snapshot of the running vcpu, captured by libkrun on a
+ /// timer interrupt rather than by an in-guest probe — that's the
+ /// hypervisor's superpower.  Body wire format:
+@@ -412,7 +412,7 @@
+ /// upward if a future event needs to ride a larger payload.
+ pub const SELF_TRACE_MAX_BODY: usize = 4096;
+ 
+-/// Profile-sample flag bits (Phase M).  Stored in the `flags` u32
++/// Profile-sample flag bits.  Stored in the `flags` u32
+ /// of the per-sample header.  Allocate by appending; never reuse a
+ /// bit position.
+ ///
+@@ -433,8 +433,8 @@
+ pub const PROFILE_SAMPLE_FLAG_STACK_INCOMPLETE: u32 = 1 << 2;
+ 
+ // =====================================================================
+-// BTF-CO-RE field relocations — Phase N (driver-VMM binding durability
+-// across kernel versions).
++// BTF-CO-RE field relocations — driver-VMM binding durability
++// across kernel versions.
+ //
+ // Today bifrost reads kernel struct fields at hardcoded offsets that
+ // match the bundled 6.12.76 kernel.  When upstream kernels shift a
+@@ -461,7 +461,7 @@
+ //   - `struct_name`         BTF type name to look up.
+ //   - `field_name`          field within the struct.  Today: simple
+ //                           name; nested paths like "mm.start_brk"
+-//                           are a Phase N.2 extension.
++//                           are a future extension.
+ // =====================================================================
+ 
+ /// Patcher writes the resolved field offset (in bytes) into the
+@@ -480,18 +480,18 @@
+ 
+ /// Maximum length of a struct or field name in a field-reloc record.
+ /// 255 because `name_len` is encoded as `u8`; bumping to a wider
+-/// length prefix would be a Phase N.2 wire change.
++/// length prefix would be a future wire change.
+ pub const FIELD_RELOC_NAME_MAX: usize = 255;
+ 
+ /// Per-program flag bit (in `BifrostProgramHeader::flags` bits 8..31)
+ /// signaling that the program body carries a field-reloc section
+ /// after the kfunc-relocs section.  Old decoders ignore the bit and
+ /// stop after kfunc-relocs; new decoders read the field-reloc
+-/// section.  Phase N.2 wires the body integration; this constant
++/// section.  A later change wires the body integration; this constant
+ /// reserves the bit so the bit position is pinned now.
+ pub const PROGRAM_FLAG_FIELD_RELOCS_PRESENT: u32 = 1 << 8;
+ 
+-/// Maximum stack frames in a single profile-N sample (Phase M).
++/// Maximum stack frames in a single profile-N sample.
+ /// Bounds the per-sample emit buffer at roughly 16 + 8*MAX bytes;
+ /// the libkrun-side sampler walks the guest stack until it hits
+ /// this cap or fails a frame-pointer dereference.  256 frames at
+@@ -514,10 +514,10 @@
+ /// OBSERVER_ATTACH, before the first LOAD_PROG.  Body is the codec
+ /// output of `bifrost_wire::codec::encode_hello` —
+ /// `[u32 wire_major][u32 wire_minor][u64 feature_bits][u16 num_fields]
+-/// [fields...]`.  Phase I (the driver↔VMM binding spine):
++/// [fields...]`.  This is the driver↔VMM binding spine:
+ /// `CANONICAL_SHA256` keeps catching exact wire-body drift; HELLO
+ /// adds capability negotiation on top of that pin so optional record
+-/// kinds (Phase H emit, future profile-N samples, future hyp:::
++/// kinds (self-trace emit, future profile-N samples, future hyp:::
+ /// records) can be feature-gated rather than version-pinned.  Driver
+ /// replies with `D4_KIND_OBSERVER_HELLO_ACK` carrying its own
+ /// (wire_major, wire_minor, feature_bits) plus an `accepted` flag.
+@@ -622,7 +622,7 @@
+ ///
+ /// `seq` echoes the original HELLO request's seq.
+ pub const D4_KIND_OBSERVER_HELLO_ACK: u32 = 106;
+-/// Unsolicited push from libkrun — one profile-N sample (Phase M).
++/// Unsolicited push from libkrun — one profile-N sample.
+ /// Body is the codec output of
+ /// `bifrost_wire::codec::encode_profile_sample`:
+ /// `[u32 pid][u32 tid][u32 cpu_id][u32 flags][u32 num_frames]
+@@ -675,7 +675,7 @@
+ //
+ // Bits 0..15 reserved for "core protocol" features (handshake itself,
+ // extensible record discipline).  Bits 16..31 for record-kind
+-// capabilities (Phase H emit, LOADPROG_STATUS, etc).  Bits 32..47 for
++// capabilities (self-trace emit, LOADPROG_STATUS, etc).  Bits 32..47 for
+ // future provider catalog (profile-N, stable proc:::, sched:::, io:::,
+ // syscall:::).  Bits 48+ reserved.
+ 
+@@ -691,13 +691,13 @@
+ 
+ /// The peer produces/consumes per-program LOAD_PROG status pushes
+ /// (`D4_KIND_LOAD_PROG_STATUS`, codec-encoded via
+-/// `encode_loadprog_status`).  Phase B.
++/// `encode_loadprog_status`).
+ pub const FEATURE_LOADPROG_STATUS: u64 = 1 << 16;
+ /// The peer produces/consumes structured self-trace events
+-/// (`D4_KIND_SELF_TRACE_PUSH`).  Phase H.
++/// (`D4_KIND_SELF_TRACE_PUSH`).
+ pub const FEATURE_SELF_TRACE_EMIT: u64 = 1 << 17;
+ /// The peer produces/consumes USDT-shape probes
+-/// (`PROBE_TYPE_USDT`).  Phase A.
++/// (`PROBE_TYPE_USDT`).
+ pub const FEATURE_USDT: u64 = 1 << 18;
+ /// The peer produces/consumes FBT-shape probes
+ /// (`PROBE_TYPE_FENTRY/FEXIT`).
+@@ -709,25 +709,25 @@
+ /// (`PROBE_TYPE_UPROBE_BY_SYM/URETPROBE_BY_SYM`).
+ pub const FEATURE_UPROBE_BY_SYM: u64 = 1 << 21;
+ /// The peer registers an explicit observer_id at HELLO time and
+-/// supports concurrent observers fanned out per id (Phase J).
++/// supports concurrent observers fanned out per id.
+ /// Today's libkrun does NOT advertise this — it's the forward
+ /// commitment.  When a peer advertises this bit, every record on
+ /// the rsp ring is keyed by observer_id and the slot table accepts
+ /// non-overlapping LOAD_PROG ownership across observers.
+ pub const FEATURE_MULTI_OBSERVER: u64 = 1 << 22;
+ /// The peer produces/consumes timer-driven profile-N samples
+-/// (`D4_KIND_PROFILE_SAMPLE`, `PROFILE_SAMPLE_PROBE_ID`).  Phase M
++/// (`D4_KIND_PROFILE_SAMPLE`, `PROFILE_SAMPLE_PROBE_ID`)
+ /// — the hypervisor-only superpower.  When set on the libkrun side,
+ /// the device runs a vcpu sampler at the negotiated frequency and
+ /// pushes samples through the bifrost rsp ring.
+ pub const FEATURE_PROFILE_N: u64 = 1 << 32;
+-/// The peer produces/consumes BTF-CO-RE field relocations (Phase N).
++/// The peer produces/consumes BTF-CO-RE field relocations.
+ /// When negotiated, BFR7 wrappers carry a per-program field-reloc
+ /// section that the libkrun-side patcher resolves against guest BTF
+ /// at LOAD_PROG time, replacing hardcoded struct field offsets with
+ /// kernel-version-specific values.  Forward-looking; today's libkrun
+-/// does NOT advertise this — Phase N.1 lays the codec, Phase N.2
+-/// wires the patcher.
++/// does NOT advertise this — the codec is laid down ahead of the
++/// patcher that consumes it.
+ pub const FEATURE_BTF_FIELD_RELOC: u64 = 1 << 33;
+ 
+ /// Mask covering the features any current-generation peer is
+@@ -754,8 +754,8 @@
+ /// (a HELLO field carrying `required_features: u64`).  CLI should
+ /// either drop the requirement or refuse to attach.
+ pub const HELLO_REJECT_MISSING_REQUIRED_FEATURE: u8 = 2;
+-/// Driver is busy with another observer that hasn't yielded.  Phase J
+-/// (multi-observer) eliminates this; today's slot table is 1-at-a-time.
++/// Driver is busy with another observer that hasn't yielded.
++/// Multi-observer support eliminates this; today's slot table is 1-at-a-time.
+ pub const HELLO_REJECT_OBSERVER_BUSY: u8 = 3;
+ /// Catch-all for failures the driver hasn't classified.  Use the
+ /// reason field for diagnostic detail; allocate a new constant if
+-- 
+2.50.1 (Apple Git-155)
+

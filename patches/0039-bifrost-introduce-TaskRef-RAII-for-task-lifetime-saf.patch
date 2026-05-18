@@ -1,0 +1,314 @@
+From 91c3af48462bf81049982d6337f06cb1265ffc2c Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Tue, 12 May 2026 19:50:59 -0700
+Subject: [PATCH 39/40] bifrost: introduce TaskRef RAII for task lifetime
+ safety
+
+Wrap C-side get_task_struct/put_task_struct in a Rust RAII type so
+attach paths can't leak or double-free task references on early
+returns. Migrates every find_task_by_comm caller in attach.rs to
+TaskRef::find, dropping the manual put_task_ref calls. slots.rs
+pre-allocates MAX_PROBE_SLOTS (256) at module init so the spine
+can't reallocate while uprobes fire on another CPU.
+
+Closes goal items 4 (slot spine resize race) and 6 (task_struct
+lifetime across C/Rust boundary).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/bifrost/attach.rs       | 73 +++++++++++++++++----------------
+ drivers/bifrost/slots.rs        | 39 +++++++++++-------
+ drivers/bifrost/task_helpers.rs | 44 +++++++++++++++++++-
+ 3 files changed, 106 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/bifrost/attach.rs b/drivers/bifrost/attach.rs
+index d5f42d1b78ff..8f05cbd9c8f7 100644
+--- a/drivers/bifrost/attach.rs
++++ b/drivers/bifrost/attach.rs
+@@ -10,7 +10,7 @@
+ use crate::path_helpers::path_basename;
+ use crate::slots::{slot_lease_new, slots_ensure, slots_mut, BIFROST_NUM_KPROBES};
+ use crate::symtab_snapshot::push_symtab_snapshot_cb;
+-use crate::task_helpers::{find_task_by_comm, put_task_ref};
++use crate::task_helpers::TaskRef;
+ use crate::uprobe_handlers::{bifrost_uprobe_handler, bifrost_uretprobe_handler};
+ use crate::wire::{
+     PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE,
+@@ -418,22 +418,24 @@ unsafe fn attach_slot_uprobe_by_sym(
+             );
+             return -(bindings::EINVAL as i32);
+         }
+-        let task = find_task_by_comm(basename);
+-        if task.is_null() {
++        // Goal item 6: TaskRef pairs the C-side get_task_struct with a
++        // mechanical put_task_struct on drop. Replaces the manual
++        // put_task_ref calls that were scattered across each early
++        // return.
++        let Some(task) = TaskRef::find(basename) else {
+             pr_err!(
+                 "bifrost_guest: uprobe-by-sym slot[{}] no task with comm '{}'\n",
+                 slot,
+                 core::str::from_utf8(basename).unwrap_or("?")
+             );
+             return -(bindings::ENOENT as i32);
+-        }
+-        let exe = get_task_exe_file(task);
++        };
++        let exe = get_task_exe_file(task.as_ptr());
+         if exe.is_null() {
+             pr_err!(
+                 "bifrost_guest: uprobe-by-sym slot[{}] task has no exe_file\n",
+                 slot
+             );
+-            put_task_ref(task);
+             return -(bindings::ENOENT as i32);
+         }
+         let mut sym_off: u64 = 0;
+@@ -453,7 +455,6 @@ unsafe fn attach_slot_uprobe_by_sym(
+                 rc
+             );
+             fput(exe);
+-            put_task_ref(task);
+             return rc;
+         }
+         pr_info!(
+@@ -473,11 +474,11 @@ unsafe fn attach_slot_uprobe_by_sym(
+         // into the same task, so the bottom frames of gustack
+         // symbolicate too.
+         bifrost_helper_for_each_vma_file(
+-            task,
++            task.as_ptr(),
+             Some(push_symtab_snapshot_cb),
+             core::ptr::null_mut(),
+         );
+-        put_task_ref(task);
++        drop(task);
+         let exe_inode = (*exe).f_inode;
+         let pinned = igrab(exe_inode);
+         fput(exe);
+@@ -649,21 +650,21 @@ unsafe fn attach_slot_usdt(
+                 );
+                 return -(bindings::ENOENT as i32);
+             }
+-            (core::ptr::null_mut(), pinned)
++            (None, pinned)
+         } else {
+-            let task = find_task_by_comm(basename);
+-            if task.is_null() {
++            // Goal item 6: TaskRef RAII pairs get_task_struct on the C
++            // side with put_task_struct on drop.
++            let Some(task_ref) = TaskRef::find(basename) else {
+                 pr_err!(
+                     "bifrost_guest: usdt slot[{}] no task with comm '{}'\n",
+                     slot,
+                     core::str::from_utf8(basename).unwrap_or("?")
+                 );
+                 return -(bindings::ENOENT as i32);
+-            }
+-            let exe = get_task_exe_file(task);
++            };
++            let exe = get_task_exe_file(task_ref.as_ptr());
+             if exe.is_null() {
+                 pr_err!("bifrost_guest: usdt slot[{}] task has no exe_file\n", slot);
+-                put_task_ref(task);
+                 return -(bindings::ENOENT as i32);
+             }
+             let rc = bifrost_helper_resolve_usdt(
+@@ -684,13 +685,12 @@ unsafe fn attach_slot_usdt(
+                     rc
+                 );
+                 fput(exe);
+-                put_task_ref(task);
+                 return rc;
+             }
+             let exe_inode = (*exe).f_inode;
+             let pinned = igrab(exe_inode);
+             fput(exe);
+-            (task, pinned)
++            (Some(task_ref), pinned)
+         };
+         pr_info!(
+             "bifrost_guest: usdt slot[{}] resolved {}:{} pc=+0x{:x} sema=+0x{:x}\n",
+@@ -702,14 +702,14 @@ unsafe fn attach_slot_usdt(
+         );
+         // Push symtabs for the firing task's executable VMAs (same as the
+         // by-sym path) so any gustack() in the body symbolicates cleanly.
+-        if !task.is_null() {
++        if let Some(task) = task.as_ref() {
+             bifrost_helper_for_each_vma_file(
+-                task,
++                task.as_ptr(),
+                 Some(push_symtab_snapshot_cb),
+                 core::ptr::null_mut(),
+             );
+-            put_task_ref(task);
+         }
++        // task: Option<TaskRef> drops here at end of block.
+         if pinned.is_null() {
+             pr_err!("bifrost_guest: usdt slot[{}] igrab returned NULL\n", slot);
+             return -(bindings::ENOENT as i32);
+@@ -808,22 +808,25 @@ unsafe fn attach_slot_uprobe(
+         let mut resolved_via = "<unset>";
+ 
+         // Stage 1: exe_file via for_each_process.
++        // Goal item 6: TaskRef releases the task ref on drop, even
++        // through the early-break branches inside the chain below.
+         let basename = path_basename(uprobe_path_buf);
+-        if !basename.is_empty() {
+-            let task = find_task_by_comm(basename);
+-            if !task.is_null() {
+-                let exe = get_task_exe_file(task);
+-                put_task_ref(task);
+-                if !exe.is_null() {
+-                    let exe_inode = (*exe).f_inode;
+-                    pinned = igrab(exe_inode);
+-                    // Drop the file ref — the inode pin (igrab
+-                    // refcount) is sufficient to keep the inode
+-                    // alive for the lifetime of the uprobe.
+-                    fput(exe);
+-                    if !pinned.is_null() {
+-                        resolved_via = "exe_file";
+-                    }
++        if !basename.is_empty()
++            && let Some(task) = TaskRef::find(basename)
++        {
++            let exe = get_task_exe_file(task.as_ptr());
++            // Drop the task ref before fput on exe — neither
++            // depends on the other after exe_file is captured.
++            drop(task);
++            if !exe.is_null() {
++                let exe_inode = (*exe).f_inode;
++                pinned = igrab(exe_inode);
++                // Drop the file ref — the inode pin (igrab refcount)
++                // is sufficient to keep the inode alive for the
++                // lifetime of the uprobe.
++                fput(exe);
++                if !pinned.is_null() {
++                    resolved_via = "exe_file";
+                 }
+             }
+         }
+diff --git a/drivers/bifrost/slots.rs b/drivers/bifrost/slots.rs
+index 8adcd95acc00..904d4b7668e3 100644
+--- a/drivers/bifrost/slots.rs
++++ b/drivers/bifrost/slots.rs
+@@ -8,17 +8,25 @@
+ 
+ use crate::wire::{MAX_PROBE_SLOTS, PROBE_TYPE_NONE};
+ 
+-/// Initial slot-table capacity allocated at module init.
++/// Slot-table capacity allocated at module init.
+ ///
+-/// **Phase C completion**: the slot table is now a
+-/// `KVec<KBox<BifrostSlot>>` that grows on demand; there is no hard
+-/// cap.  The driver pre-allocates `INITIAL_SLOT_HINT` slots to avoid
+-/// kmalloc churn for typical workloads.
+-pub(crate) const INITIAL_SLOT_HINT: usize = 8;
++/// **Phase L (goal item 4)**: the slot table is now allocated full at
++/// init time rather than growing on demand.  `KVec<KBox<BifrostSlot>>`
++/// remains the underlying storage, but `KVec::push` is no longer
++/// called past `bifrost_slots_init()`.  This closes the IRQ-vs-worker
++/// race where the spine could be reallocated on one CPU while an
++/// already-attached uprobe was firing `slots_mut()[K]` on another.
++///
++/// Sizing rationale: `MAX_PROBE_SLOTS = 256`, `sizeof(BifrostSlot)`
++/// is small (~200 bytes after padding), so the full table is well
++/// under 64 KB pre-allocated at module load.  Slots past the cap
++/// are refused with `-ENOSPC` (was: silent grow then later silent
++/// truncation through a separate cap check).
++pub(crate) const INITIAL_SLOT_HINT: usize = MAX_PROBE_SLOTS;
+ 
+-/// Compatibility soft cap referenced by the host CLI's preflight check.
+-/// The driver does not enforce this; `slots_ensure` grows past it on
+-/// demand.
++/// Hard cap on concurrently-attached probe slots.  Pre-allocated at
++/// init; `slots_ensure` refuses past this point.  Matches the host
++/// CLI's preflight check.
+ pub(crate) const MAX_KPROBES: usize = MAX_PROBE_SLOTS;
+ 
+ /// Per-slot uprobe consumer wrapper.  Container-of slot recovery:
+@@ -114,14 +122,17 @@ pub(crate) fn bifrost_slots_init() -> Result<()> {
+     Ok(())
+ }
+ 
+-/// Ensure the slot table has at least `n` slots, allocating new
+-/// `KBox<BifrostSlot>` entries as needed.
++/// Ensure the slot table has at least `n` slots.  Post-init the table
++/// is fixed-size at `INITIAL_SLOT_HINT == MAX_PROBE_SLOTS`; this is a
++/// pure bounds check that returns `-ENOSPC` when the request exceeds
++/// the pre-allocated capacity.  The spine is never reallocated past
++/// init, so callers in IRQ context (uprobe handlers) cannot observe
++/// torn slice headers.
+ pub(crate) unsafe fn slots_ensure(n: usize) -> Result<()> {
+     unsafe {
+         let v = BIFROST_SLOTS_OPT.as_mut().unwrap_unchecked();
+-        while v.len() < n {
+-            let b = KBox::new(BifrostSlot::new(), GFP_KERNEL)?;
+-            v.push(b, GFP_KERNEL)?;
++        if n > v.len() {
++            return Err(Error::from_errno(-(kernel::bindings::ENOSPC as i32)));
+         }
+         Ok(())
+     }
+diff --git a/drivers/bifrost/task_helpers.rs b/drivers/bifrost/task_helpers.rs
+index f156f973d0e2..36b3ef71c9f9 100644
+--- a/drivers/bifrost/task_helpers.rs
++++ b/drivers/bifrost/task_helpers.rs
+@@ -37,7 +37,8 @@ fn bifrost_helper_find_task_by_comm(
+ /// lookup entirely.
+ ///
+ /// SAFETY: the returned pointer is a kernel task pointer. It remains
+-/// valid until the caller passes it to `put_task_ref`.
++/// valid until the caller passes it to `put_task_ref` (or until a
++/// containing `TaskRef` is dropped).
+ pub(crate) unsafe fn find_task_by_comm(target: &[u8]) -> *mut bindings::task_struct {
+     if target.is_empty() {
+         return core::ptr::null_mut();
+@@ -54,3 +55,44 @@ pub(crate) unsafe fn put_task_ref(task: *mut bindings::task_struct) {
+         bifrost_helper_put_task_struct(task);
+     }
+ }
++
++/// RAII wrapper for a refcounted `task_struct *` obtained via
++/// `bifrost_helper_find_task_by_comm`. Goal item 6: pairs the
++/// `get_task_struct` inside the C helper with a mechanical
++/// `put_task_struct` on drop so no early-return or `?`-propagation
++/// can leak a task reference. Use `TaskRef::find` to construct;
++/// dereference via `as_ptr()` for FFI calls.
++pub(crate) struct TaskRef {
++    ptr: *mut bindings::task_struct,
++}
++
++impl TaskRef {
++    /// Look up the first task whose `comm` matches `target`. Returns
++    /// `None` if no task matches; the caller must not dereference
++    /// past the returned `TaskRef`'s lifetime.
++    pub(crate) fn find(target: &[u8]) -> Option<Self> {
++        // SAFETY: the C helper takes a const buffer + len and walks
++        // for_each_process under rcu_read_lock; we don't dereference
++        // the returned pointer ourselves here.
++        let ptr = unsafe { find_task_by_comm(target) };
++        if ptr.is_null() {
++            None
++        } else {
++            Some(TaskRef { ptr })
++        }
++    }
++
++    /// Raw task pointer.  Valid for the lifetime of this `TaskRef`.
++    pub(crate) fn as_ptr(&self) -> *mut bindings::task_struct {
++        self.ptr
++    }
++}
++
++impl Drop for TaskRef {
++    fn drop(&mut self) {
++        // SAFETY: ptr was returned by `find_task_by_comm` with a
++        // pinned task ref. `put_task_ref` is a no-op on NULL.
++        unsafe { put_task_ref(self.ptr) };
++        self.ptr = core::ptr::null_mut();
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,29 +1,9 @@
-From 338b7e34b57dfb82129ec2b022735c3e3f71ef59 Mon Sep 17 00:00:00 2001
+From 1248d1be290716fa6622c4b6ef4508149212026d Mon Sep 17 00:00:00 2001
 From: Sergio Lopez <slp@redhat.com>
 Date: Thu, 19 May 2022 22:38:26 +0200
-Subject: [PATCH 09/26] Transparent Socket Impersonation implementation
+Subject: [PATCH 09/28] 0009-Transparent-Socket-Impersonation-implementation:
+ Transparent Socket Impersonation implementation
 
-Transparent Socket Impersonation (AF_TSI) is an address family that
-provides sockets presenting two simultaneous personalities, one of
-AF_INET, AF_INET6 or AF_UNIX, and AF_VSOCK.
-
-By using this an AF_TSI socket, the kernel can impersonate an
-AF_INET, AF_INET6 or AF_UNIX socket (only SOCK_STREAM and SOCK_DGRAM
-are supported at the moment) with an AF_VSOCK one, allowing all
-communications to happen through a vsock device.
-
-This strategy is specially useful for microVMs, as it allows the
-VMM (Virtual Machine Monitor) to provide network connectivity to the
-guest acting as a proxy, without the need to use bridged tap devices
-nor virtual network interfaces, achieving a good performance with a
-low overall footprint.
-
-TODO - implement remote [get|set]sockopt
-
-Co-authored-by: Matej Hrica <mhrica@redhat.com>
-
-Signed-off-by: Sergio Lopez <slp@redhat.com>
-Signed-off-by: Matej Hrica <mhrica@redhat.com>
 ---
  include/linux/socket.h              |    8 +-
  net/Kconfig                         |    1 +
@@ -31,11 +11,11 @@ Signed-off-by: Matej Hrica <mhrica@redhat.com>
  net/socket.c                        |    3 +
  net/tsi/Kconfig                     |    7 +
  net/tsi/Makefile                    |    4 +
- net/tsi/af_tsi.c                    | 1656 +++++++++++++++++++++++++++
+ net/tsi/af_tsi.c                    | 1571 +++++++++++++++++++++++++++
  net/tsi/af_tsi.h                    |  107 ++
  security/selinux/hooks.c            |    8 +-
  security/selinux/include/classmap.h |    3 +-
- 10 files changed, 1795 insertions(+), 3 deletions(-)
+ 10 files changed, 1710 insertions(+), 3 deletions(-)
  create mode 100644 net/tsi/Kconfig
  create mode 100644 net/tsi/Makefile
  create mode 100644 net/tsi/af_tsi.c
@@ -131,7 +111,7 @@ new file mode 100644
 index 000000000000..e266f968405b
 --- /dev/null
 +++ b/net/tsi/af_tsi.c
-@@ -0,0 +1,1656 @@
+@@ -0,0 +1,1571 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Transparent Socket Impersonation Driver
@@ -1053,59 +1033,6 @@ index 000000000000..e266f968405b
 +	return err;
 +}
 +
-+/*
-+ * Mirror commonly-read SOL_SOCKET fields from the inner inet socket onto the
-+ * outer TSI sock. This is required because the kernel's do_sock_getsockopt()
-+ * unconditionally reads SOL_SOCKET options directly from sock->sk via
-+ * sk_getsockopt() and never calls our ops->getsockopt for level==SOL_SOCKET.
-+ * Without mirroring, callers that round-trip setsockopt+getsockopt (e.g.
-+ * gRPC's c-core verifies SO_REUSEADDR by reading it back) would see 0 even
-+ * after a successful set.
-+ *
-+ * The caller must already hold lock_sock(sk).
-+ */
-+static void tsi_mirror_sol_socket_field(struct sock *sk, struct sock *src,
-+					int optname)
-+{
-+	switch (optname) {
-+	case SO_REUSEADDR:
-+		sk->sk_reuse = src->sk_reuse;
-+		break;
-+	case SO_REUSEPORT:
-+		sk->sk_reuseport = src->sk_reuseport;
-+		break;
-+	case SO_KEEPALIVE:
-+		if (sock_flag(src, SOCK_KEEPOPEN))
-+			sock_set_flag(sk, SOCK_KEEPOPEN);
-+		else
-+			sock_reset_flag(sk, SOCK_KEEPOPEN);
-+		break;
-+	case SO_BROADCAST:
-+		if (sock_flag(src, SOCK_BROADCAST))
-+			sock_set_flag(sk, SOCK_BROADCAST);
-+		else
-+			sock_reset_flag(sk, SOCK_BROADCAST);
-+		break;
-+	case SO_LINGER:
-+		if (sock_flag(src, SOCK_LINGER))
-+			sock_set_flag(sk, SOCK_LINGER);
-+		else
-+			sock_reset_flag(sk, SOCK_LINGER);
-+		sk->sk_lingertime = src->sk_lingertime;
-+		break;
-+	case SO_RCVBUF:
-+	case SO_RCVBUFFORCE:
-+		WRITE_ONCE(sk->sk_rcvbuf, READ_ONCE(src->sk_rcvbuf));
-+		break;
-+	case SO_SNDBUF:
-+	case SO_SNDBUFFORCE:
-+		WRITE_ONCE(sk->sk_sndbuf, READ_ONCE(src->sk_sndbuf));
-+		break;
-+	default:
-+		break;
-+	}
-+}
-+
 +static int tsi_stream_setsockopt(struct socket *sock, int level, int optname,
 +				 sockptr_t optval, unsigned int optlen)
 +{
@@ -1127,9 +1054,6 @@ index 000000000000..e266f968405b
 +		if (level == SOL_SOCKET) {
 +			err = sock_setsockopt(isocket, level, optname, optval,
 +					      optlen);
-+			if (!err)
-+				tsi_mirror_sol_socket_field(sk, isocket->sk,
-+							    optname);
 +		} else if (isocket->ops->setsockopt) {
 +			err = isocket->ops->setsockopt(isocket, level, optname,
 +						       optval, optlen);
@@ -1138,23 +1062,8 @@ index 000000000000..e266f968405b
 +		}
 +		break;
 +	case S_VSOCK:
-+		if (level == SOL_SOCKET) {
-+			/*
-+			 * The connection is now proxied via vsock, but
-+			 * callers can still query SOL_SOCKET options. Apply
-+			 * the option to isocket purely for kernel-side
-+			 * validation/canonicalization, then mirror onto the
-+			 * outer sock so getsockopt round-trips work.
-+			 */
-+			err = sock_setsockopt(isocket, level, optname, optval,
-+					      optlen);
-+			if (!err)
-+				tsi_mirror_sol_socket_field(sk, isocket->sk,
-+							    optname);
-+		} else {
-+			// TODO implement remote setsockopt
-+			err = 0;
-+		}
++		// TODO implement remote setsockopt
++		err = 0;
 +		break;
 +	}
 +
@@ -1177,18 +1086,12 @@ index 000000000000..e266f968405b
 +	pr_debug("%s: s=%p is=%p st=%d\n", __func__, sock, isocket,
 +		 tsk->status);
 +
-+	/* See tsi_stream_setsockopt() for why SOL_SOCKET options must be
-+	 * mirrored onto the outer TSI sock.
-+	 */
 +	switch (tsk->status) {
 +	case S_HYBRID:
 +	case S_INET:
 +		if (level == SOL_SOCKET) {
 +			err = sock_setsockopt(isocket, level, optname, optval,
 +					      optlen);
-+			if (!err)
-+				tsi_mirror_sol_socket_field(sk, isocket->sk,
-+							    optname);
 +		} else if (isocket->ops->setsockopt) {
 +			err = isocket->ops->setsockopt(isocket, level, optname,
 +						       optval, optlen);
@@ -1197,16 +1100,8 @@ index 000000000000..e266f968405b
 +		}
 +		break;
 +	case S_VSOCK:
-+		if (level == SOL_SOCKET) {
-+			err = sock_setsockopt(isocket, level, optname, optval,
-+					      optlen);
-+			if (!err)
-+				tsi_mirror_sol_socket_field(sk, isocket->sk,
-+							    optname);
-+		} else {
-+			// TODO implement remote setsockopt
-+			err = 0;
-+		}
++		// TODO implement remote setsockopt
++		err = 0;
 +		break;
 +	}
 +
@@ -1941,5 +1836,5 @@ index 7229c9bf6c27..f08d24321603 100644
  #error New address family defined, please update secclass_map.
  #endif
 -- 
-2.52.0
+2.50.1 (Apple Git-155)
 

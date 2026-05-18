@@ -1,0 +1,2290 @@
+From d7cafb52f8acce3027c962e210b4334d7619acc2 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Mon, 11 May 2026 21:38:50 -0700
+Subject: [PATCH] bifrost: split guest attach paths
+
+---
+ drivers/bifrost/attach.rs  | 1057 +++++++++++++++++++++++++++++++++
+ drivers/bifrost/bifrost.rs | 1136 +-----------------------------------
+ 2 files changed, 1068 insertions(+), 1125 deletions(-)
+ create mode 100644 drivers/bifrost/attach.rs
+
+diff --git a/drivers/bifrost/attach.rs b/drivers/bifrost/attach.rs
+new file mode 100644
+index 000000000000..d5f42d1b78ff
+--- /dev/null
++++ b/drivers/bifrost/attach.rs
+@@ -0,0 +1,1057 @@
++// SPDX-License-Identifier: GPL-2.0
++// Probe-family attach and cleanup dispatch.
++
++use core::sync::atomic::Ordering;
++
++use kernel::bindings;
++use kernel::ffi::{c_char, c_int, c_void};
++use kernel::prelude::*;
++
++use crate::path_helpers::path_basename;
++use crate::slots::{slot_lease_new, slots_ensure, slots_mut, BIFROST_NUM_KPROBES};
++use crate::symtab_snapshot::push_symtab_snapshot_cb;
++use crate::task_helpers::{find_task_by_comm, put_task_ref};
++use crate::uprobe_handlers::{bifrost_uprobe_handler, bifrost_uretprobe_handler};
++use crate::wire::{
++    PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE,
++    PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
++};
++use crate::{free_slot_prog, BifrostGuest, BIFROST_TRACING_LINK_OPS};
++
++extern "C" {
++    fn bpf_get_raw_tracepoint(name: *const c_char) -> *mut bindings::bpf_raw_event_map;
++    fn bpf_put_raw_tracepoint(btp: *mut bindings::bpf_raw_event_map);
++    fn bpf_probe_register(
++        btp: *mut bindings::bpf_raw_event_map,
++        link: *mut bindings::bpf_raw_tp_link,
++    ) -> c_int;
++    fn bpf_probe_unregister(
++        btp: *mut bindings::bpf_raw_event_map,
++        link: *mut bindings::bpf_raw_tp_link,
++    ) -> c_int;
++    fn uprobe_register(
++        inode: *mut bindings::inode,
++        offset: i64,
++        ref_ctr_offset: i64,
++        uc: *mut bindings::uprobe_consumer,
++    ) -> *mut bindings::uprobe;
++    fn uprobe_unregister_nosync(uprobe: *mut bindings::uprobe, uc: *mut bindings::uprobe_consumer);
++    fn kern_path(name: *const c_char, flags: core::ffi::c_uint, path: *mut bindings::path)
++        -> c_int;
++    fn path_put(path: *const bindings::path);
++    fn igrab(inode: *mut bindings::inode) -> *mut bindings::inode;
++    fn iput(inode: *mut bindings::inode);
++    fn get_task_exe_file(task: *mut bindings::task_struct) -> *mut bindings::file;
++    fn fput(file: *mut bindings::file);
++    fn bifrost_helper_resolve_symbol(
++        file: *mut bindings::file,
++        symbol_name: *const u8,
++        symbol_name_len: u32,
++        out_file_offset: *mut u64,
++        out_size: *mut u64,
++    ) -> c_int;
++    fn bifrost_helper_resolve_usdt(
++        file: *mut bindings::file,
++        provider_name: *const u8,
++        provider_name_len: u32,
++        probe_name: *const u8,
++        probe_name_len: u32,
++        out_pc_file_offset: *mut u64,
++        out_semaphore_file_offset: *mut u64,
++    ) -> c_int;
++    fn bifrost_helper_for_each_vma_file(
++        task: *mut bindings::task_struct,
++        cb: Option<unsafe extern "C" fn(*mut bindings::file, *mut c_void)>,
++        ctx: *mut c_void,
++    );
++}
++
++/// Inputs for `slot_family_attach`, borrowed against the LOAD_PROG
++/// worker's stack-resident parse buffer.
++pub(crate) struct AttachExt<'a> {
++    pub(crate) name_str: &'a str,
++    pub(crate) target_name: [u8; 32],
++    pub(crate) uprobe_basename: &'a [u8],
++    pub(crate) uprobe_symbol: &'a [u8],
++    pub(crate) uprobe_provider: &'a [u8],
++    pub(crate) uprobe_path_buf: &'a [u8; 257],
++    pub(crate) uprobe_file_offset: u64,
++}
++
++/// Centralized attach dispatch.  Allocates a fresh slot lease,
++/// stores it in `slots_mut()[slot].lease`, then forwards to the
++/// per-family attach.  The lease is issued *before* dispatch so a
++/// failed attach still has a recorded lease for diagnostics; the
++/// cleanup path tolerates `lease == 0` for slots that never got
++/// attached.
++///
++/// Returns 0 on success or a negative errno from the per-family attach.
++/// On failure, the JIT'd program stored in the slot is released and the
++/// lease is cleared so the worker can report truthful LOAD_PROG status.
++pub(crate) unsafe fn slot_family_attach(
++    slot: usize,
++    probe_type: u8,
++    bg: *mut BifrostGuest,
++    ext: &AttachExt<'_>,
++) -> c_int {
++    unsafe {
++        // Heap-migration: grow the slot table here so the
++        // family-specific attach below can index slot N safely.
++        // The LOAD_PROG dispatch already grew before reaching us
++        // for the common case; this is the defensive grow that
++        // covers any future caller path.
++        if slots_ensure(slot + 1).is_err() {
++            pr_err!(
++                "bifrost_guest: slot table grow to len={} failed in slot_family_attach\n",
++                slot + 1
++            );
++            return -(bindings::ENOMEM as i32);
++        }
++        slots_mut()[slot].lease = slot_lease_new();
++        let rc = match probe_type {
++            PROBE_TYPE_FENTRY | PROBE_TYPE_FEXIT => {
++                attach_slot_fbt(slot, probe_type, ext.name_str, bg)
++            }
++            PROBE_TYPE_TRACEPOINT => attach_slot_tracepoint(slot, ext.name_str, bg),
++            PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => attach_slot_uprobe(
++                slot,
++                probe_type,
++                ext.name_str,
++                ext.uprobe_path_buf,
++                ext.uprobe_file_offset,
++                bg,
++            ),
++            PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => attach_slot_uprobe_by_sym(
++                slot,
++                probe_type,
++                ext.uprobe_basename,
++                ext.uprobe_symbol,
++                bg,
++            ),
++            PROBE_TYPE_USDT => attach_slot_usdt(
++                slot,
++                ext.uprobe_basename,
++                ext.uprobe_provider,
++                ext.uprobe_symbol,
++                bg,
++            ),
++            _ => {
++                pr_err!(
++                    "bifrost_guest: unsupported probe_type {} for target='{}' slot[{}] — bifrost driver no longer dispatches kprobe (probe_types 0/1)\n",
++                    probe_type,
++                    ext.name_str,
++                    slot
++                );
++                -(bindings::EINVAL as i32)
++            }
++        };
++        if rc != 0 {
++            free_slot_prog(slot);
++            slots_mut()[slot].lease = 0;
++        }
++        rc
++    }
++}
++
++/// Centralized cleanup dispatch.  Returns true if the slot was a
++/// uprobe family member (so the caller can run the batched
++/// `uprobe_unregister_sync()` once at the end), false otherwise.
++/// Mirrors the cleanup match in `bifrost_remove` line-for-line;
++/// adding a new family adds an arm here and a matching attach arm.
++pub(crate) unsafe fn slot_family_cleanup(slot: usize, probe_type: u8) -> bool {
++    unsafe {
++        let had_uprobe = match probe_type {
++            PROBE_TYPE_FENTRY | PROBE_TYPE_FEXIT => {
++                cleanup_slot_fbt(slot);
++                false
++            }
++            PROBE_TYPE_TRACEPOINT => {
++                cleanup_slot_tracepoint(slot);
++                false
++            }
++            PROBE_TYPE_UPROBE
++            | PROBE_TYPE_URETPROBE
++            | PROBE_TYPE_UPROBE_BY_SYM
++            | PROBE_TYPE_URETPROBE_BY_SYM
++            | PROBE_TYPE_USDT => cleanup_slot_uprobe(slot),
++            PROBE_TYPE_NONE => false,
++            other => {
++                pr_err!(
++                    "bifrost_guest: cleanup slot[{}]: unknown probe_type {} (kprobe paths retired)\n",
++                    slot,
++                    other
++                );
++                false
++            }
++        };
++        // Cleanup never grows; just zero the lease if the slot
++        // index is in range.  After the heap migration, the table
++        // length covers every attached slot by construction.
++        if slot < slots_mut().len() {
++            slots_mut()[slot].lease = 0;
++        }
++        had_uprobe
++    }
++}
++
++/// Short string label for the family that owns `probe_type`.
++/// Used by Phase H emit in a follow-up; today only diagnostic.
++#[allow(dead_code)]
++fn slot_family_label(probe_type: u8) -> &'static str {
++    match probe_type {
++        PROBE_TYPE_FENTRY | PROBE_TYPE_FEXIT => "fbt",
++        PROBE_TYPE_TRACEPOINT => "tracepoint",
++        PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => "uprobe",
++        PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => "uprobe_by_sym",
++        PROBE_TYPE_USDT => "usdt",
++        PROBE_TYPE_NONE => "none",
++        _ => "unknown",
++    }
++}
++
++/// On any error the JIT'd prog is freed and the slot stays
++/// unattached (cleanup_slot_fbt then no-ops).
++unsafe fn attach_slot_fbt(
++    slot: usize,
++    probe_type: u8,
++    name_str: &str,
++    bg: *mut BifrostGuest,
++) -> c_int {
++    unsafe {
++        let kind = if probe_type == PROBE_TYPE_FENTRY {
++            "fentry"
++        } else {
++            "fexit"
++        };
++        let attach_type: u32 = if probe_type == PROBE_TYPE_FENTRY {
++            24 // BPF_TRACE_FENTRY
++        } else {
++            25 // BPF_TRACE_FEXIT
++        };
++        let jitted = slots_mut()[slot].prog.load(Ordering::Acquire);
++        let tr = if jitted.is_null() || (*jitted).aux.is_null() {
++            core::ptr::null_mut()
++        } else {
++            (*(*jitted).aux).dst_trampoline
++        };
++        if jitted.is_null() || tr.is_null() {
++            pr_err!(
++            "bifrost_guest: {} slot[{}] target='{}': dst_trampoline missing — verifier didn't resolve attach target (BTF lookup failed?)\n",
++            kind, slot, name_str
++        );
++            return -(bindings::EINVAL as i32);
++        }
++        let link_p: *mut bindings::bpf_tracing_link = if (slot as usize) < slots_mut().len() {
++            slots_mut()[slot as usize].fbt_link.as_mut_ptr()
++        } else {
++            core::ptr::null_mut()
++        };
++        if link_p.is_null() {
++            pr_err!("bifrost_guest: {} slot[{}] OOB\n", kind, slot);
++            return -(bindings::EINVAL as i32);
++        }
++        core::ptr::write_bytes(link_p, 0, 1);
++        // bpf_link_init takes a const ops ptr.  We pass our static
++        // BIFROST_TRACING_LINK_OPS — the link is never exposed via
++        // fd, but bpf_link_init derefs ops->dealloc & ops->
++        // dealloc_deferred unconditionally so the ops ptr can't be
++        // NULL.  Cleanup happens via direct
++        // bpf_trampoline_unlink_prog + bpf_trampoline_put in
++        // cleanup_slot_fbt.
++        bindings::bpf_link_init(
++            &mut (*link_p).link.link as *mut bindings::bpf_link,
++            2, // BPF_LINK_TYPE_TRACING
++            &BIFROST_TRACING_LINK_OPS as *const bindings::bpf_link_ops,
++            jitted,
++        );
++        (*link_p).attach_type = attach_type;
++        (*link_p).trampoline = tr;
++        (*link_p).tgt_prog = core::ptr::null_mut();
++        let lret = bindings::bpf_trampoline_link_prog(
++            &mut (*link_p).link as *mut bindings::bpf_tramp_link,
++            tr,
++            core::ptr::null_mut(),
++        );
++        if lret == 0 {
++            slots_mut()[slot].fbt_linked = true;
++            BIFROST_NUM_KPROBES = slot + 1;
++            // kprobe_attached is the "any probe attached" master
++            // flag that gates cleanup; set it so bifrost_remove walks
++            // our trampoline-link cleanup arm.
++            (*bg).kprobe_attached = true;
++            pr_info!(
++                "bifrost_guest: {} slot[{}] linked to trampoline for '{}'\n",
++                kind,
++                slot,
++                name_str
++            );
++        } else {
++            pr_err!(
++                "bifrost_guest: {} slot[{}] bpf_trampoline_link_prog failed: {}\n",
++                kind,
++                slot,
++                lret
++            );
++            return lret;
++        }
++        0
++    }
++}
++
++/// Register a JIT'd raw-tracepoint prog by resolving the event
++/// name via `bpf_get_raw_tracepoint` and inserting our per-slot
++/// `bpf_raw_tp_link` via `bpf_probe_register`.
++///
++/// `target_name` carries just the tracepoint name (category is
++/// implicit — `bpf_get_raw_tracepoint` walks the
++/// `__start__bpf_raw_tp[..]` table flat).
++///
++/// On any error the JIT'd prog is freed and any acquired btp
++/// reference is dropped (`bpf_put_raw_tracepoint`) before
++/// returning.  Symmetric to cleanup_slot_tracepoint.
++unsafe fn attach_slot_tracepoint(slot: usize, name_str: &str, bg: *mut BifrostGuest) -> c_int {
++    unsafe {
++        let jitted = slots_mut()[slot].prog.load(Ordering::Acquire);
++        if jitted.is_null() {
++            pr_err!(
++                "bifrost_guest: tracepoint slot[{}]: prog NULL after JIT\n",
++                slot
++            );
++            return -(bindings::EINVAL as i32);
++        }
++        let btp = bpf_get_raw_tracepoint(slots_mut()[slot].target_name.as_ptr() as *const _);
++        if btp.is_null() {
++            pr_err!(
++            "bifrost_guest: tracepoint slot[{}] event '{}' not found in kernel tracepoint table\n",
++            slot, name_str
++        );
++            return -(bindings::ENOENT as i32);
++        }
++        let link_p: *mut bindings::bpf_raw_tp_link = if (slot as usize) < slots_mut().len() {
++            slots_mut()[slot as usize].rawtp_link.as_mut_ptr()
++        } else {
++            core::ptr::null_mut()
++        };
++        if link_p.is_null() {
++            pr_err!("bifrost_guest: tracepoint slot[{}] OOB\n", slot);
++            bpf_put_raw_tracepoint(btp);
++            return -(bindings::EINVAL as i32);
++        }
++        core::ptr::write_bytes(link_p, 0, 1);
++        // bpf_link_init: same all-None ops table as the tracing-link
++        // case; bpf_link_init derefs ops->dealloc & ops->
++        // dealloc_deferred so the ops ptr can't be NULL.
++        bindings::bpf_link_init(
++            &mut (*link_p).link as *mut bindings::bpf_link,
++            9, // BPF_LINK_TYPE_RAW_TRACEPOINT
++            &BIFROST_TRACING_LINK_OPS as *const bindings::bpf_link_ops,
++            jitted,
++        );
++        (*link_p).btp = btp;
++        let lret = bpf_probe_register(btp, link_p);
++        if lret == 0 {
++            slots_mut()[slot].rawtp_btp = btp;
++            slots_mut()[slot].rawtp_registered = true;
++            BIFROST_NUM_KPROBES = slot + 1;
++            (*bg).kprobe_attached = true;
++            pr_info!(
++                "bifrost_guest: tracepoint slot[{}] attached to event '{}'\n",
++                slot,
++                name_str
++            );
++        } else {
++            pr_err!(
++                "bifrost_guest: tracepoint slot[{}] bpf_probe_register failed: {}\n",
++                slot,
++                lret
++            );
++            bpf_put_raw_tracepoint(btp);
++            return lret;
++        }
++        0
++    }
++}
++
++/// Register a kernel-resolved uprobe (PROBE_TYPE_UPROBE_BY_SYM /
++/// URETPROBE_BY_SYM).  The CLI ferried only (basename, symbol)
++/// in the BFR7 trailer; we walk for_each_process to find a task
++/// whose `comm` matches the basename, grab its already-mapped
++/// exe_file, parse the ELF symtab for `symbol`, and register the
++/// uprobe at the resolved file offset.
++///
++/// On the way: `bifrost_helper_for_each_vma_file` pushes
++/// per-binary function symtabs to the host so the gustack
++/// renderer can symbolicate frames without reading any ELF off
++/// a host-mirrored rootfs.
++///
++/// Symmetric to cleanup_slot_uprobe.
++unsafe fn attach_slot_uprobe_by_sym(
++    slot: usize,
++    probe_type: u8,
++    basename: &[u8],
++    symbol: &[u8],
++    bg: *mut BifrostGuest,
++) -> c_int {
++    unsafe {
++        // Defense in depth: caller (slot_family_attach via the
++        // LOAD_PROG dispatch) already called slots_ensure(slot+1).
++        // This check protects against a misuse from a future caller
++        // that forgets the grow step.
++        if slot >= slots_mut().len() {
++            pr_err!(
++                "bifrost_guest: uprobe slot[{}] out of range (len={})\n",
++                slot,
++                slots_mut().len()
++            );
++            return -(bindings::EINVAL as i32);
++        }
++        // Initialize the wrapper's slot field, then expose the consumer
++        // pointer for the kernel uprobe API.  The kernel only sees the
++        // consumer; our shared handler recovers `slot` via container-of.
++        let bp_ptr = slots_mut()[slot].uprobe.as_mut_ptr();
++        (*bp_ptr).slot = slot as u32;
++        let consumer: *mut bindings::uprobe_consumer = &mut (*bp_ptr).consumer as *mut _;
++        if consumer.is_null() {
++            pr_err!(
++                "bifrost_guest: uprobe-by-sym slot[{}] consumer ptr null\n",
++                slot
++            );
++            return -(bindings::EINVAL as i32);
++        }
++        let task = find_task_by_comm(basename);
++        if task.is_null() {
++            pr_err!(
++                "bifrost_guest: uprobe-by-sym slot[{}] no task with comm '{}'\n",
++                slot,
++                core::str::from_utf8(basename).unwrap_or("?")
++            );
++            return -(bindings::ENOENT as i32);
++        }
++        let exe = get_task_exe_file(task);
++        if exe.is_null() {
++            pr_err!(
++                "bifrost_guest: uprobe-by-sym slot[{}] task has no exe_file\n",
++                slot
++            );
++            put_task_ref(task);
++            return -(bindings::ENOENT as i32);
++        }
++        let mut sym_off: u64 = 0;
++        let mut sym_size: u64 = 0;
++        let rc = bifrost_helper_resolve_symbol(
++            exe,
++            symbol.as_ptr(),
++            symbol.len() as u32,
++            &mut sym_off,
++            &mut sym_size,
++        );
++        if rc != 0 {
++            pr_err!(
++                "bifrost_guest: uprobe-by-sym slot[{}] resolve '{}' failed: {}\n",
++                slot,
++                core::str::from_utf8(symbol).unwrap_or("?"),
++                rc
++            );
++            fput(exe);
++            put_task_ref(task);
++            return rc;
++        }
++        pr_info!(
++            "bifrost_guest: uprobe-by-sym slot[{}] resolved '{}'+0x{:x} (size={})\n",
++            slot,
++            core::str::from_utf8(symbol).unwrap_or("?"),
++            sym_off,
++            sym_size
++        );
++        // Side-channel: push function symtabs for the firing task's
++        // executable VMAs to the host so its gustack renderer can
++        // symbolicate frames without reading any ELF off a
++        // host-mirrored rootfs.  Walks task->mm's VMAs (sleepable;
++        // we're in the worker thread's LOAD_PROG handler, not BPF/
++        // kprobe context) and pushes one record per unique vm_file —
++        // covers the uprobed binary AND libc/libpthread/vDSO mapped
++        // into the same task, so the bottom frames of gustack
++        // symbolicate too.
++        bifrost_helper_for_each_vma_file(
++            task,
++            Some(push_symtab_snapshot_cb),
++            core::ptr::null_mut(),
++        );
++        put_task_ref(task);
++        let exe_inode = (*exe).f_inode;
++        let pinned = igrab(exe_inode);
++        fput(exe);
++        if pinned.is_null() {
++            pr_err!(
++                "bifrost_guest: uprobe-by-sym slot[{}] igrab returned NULL\n",
++                slot
++            );
++            return -(bindings::ENOENT as i32);
++        }
++        // Reuse the same consumer-build + uprobe_register path used
++        // for host-resolved uprobes by dispatching on the *_BY_SYM
++        // variants when assigning the handler.
++        core::ptr::write_bytes(consumer, 0, 1);
++        if probe_type == PROBE_TYPE_URETPROBE_BY_SYM {
++            (*consumer).ret_handler = match slot {
++                // shared handler — slot recovered via container-of
++                _ => Some(bifrost_uretprobe_handler),
++            };
++        } else {
++            (*consumer).handler = match slot {
++                // shared handler — slot recovered via container-of
++                _ => Some(bifrost_uprobe_handler),
++            };
++        }
++        let handle = uprobe_register(pinned, sym_off as i64, 0, consumer);
++        let raw = handle as i64;
++        if (-4096..0).contains(&raw) || handle.is_null() {
++            pr_err!(
++                "bifrost_guest: uprobe-by-sym slot[{}] uprobe_register failed: {}\n",
++                slot,
++                raw
++            );
++            iput(pinned);
++            return if raw < 0 {
++                raw as c_int
++            } else {
++                -(bindings::EINVAL as i32)
++            };
++        }
++        slots_mut()[slot].uprobe_handle = handle;
++        slots_mut()[slot].uprobe_inode = pinned;
++        (*bg).kprobe_attached = true;
++        BIFROST_NUM_KPROBES = slot + 1;
++        let kind = if probe_type == PROBE_TYPE_URETPROBE_BY_SYM {
++            "uretprobe"
++        } else {
++            "uprobe"
++        };
++        pr_info!(
++            "bifrost_guest: {} slot[{}] (by-sym) registered on {}:{} +0x{:x} (sym_size={})\n",
++            kind,
++            slot,
++            core::str::from_utf8(basename).unwrap_or("?"),
++            core::str::from_utf8(symbol).unwrap_or("?"),
++            sym_off,
++            sym_size
++        );
++        0
++    }
++}
++
++/// Register a kernel-resolved USDT (PROBE_TYPE_USDT).  The CLI
++/// ferried `(basename, sdt_provider, sdt_probe)` in the BFR7
++/// trailer; we find the matching task by `comm == basename`, grab
++/// its `exe_file`, and call `bifrost_helper_resolve_usdt` to walk
++/// `.note.stapsdt`.  Symmetric to attach_slot_uprobe_by_sym but
++/// targeting the SDT note section rather than `.symtab`.
++///
++/// The semaphore offset returned by the helper is non-zero on
++/// SystemTap-style USDT probes (postgres-built-with-`--enable-dtrace`,
++/// libstapsdt, glibc); we hand it to `uprobe_register` as
++/// `ref_ctr_offset` so the kernel atomically increments the per-probe
++/// `unsigned short` flag in `.probes` on attach.  Without that the
++/// `STAP_PROBE` macro body short-circuits (no consumer registered)
++/// and the NOP at `pc` never gets executed.
++unsafe fn attach_slot_usdt(
++    slot: usize,
++    basename: &[u8],
++    sdt_provider: &[u8],
++    sdt_probe: &[u8],
++    bg: *mut BifrostGuest,
++) -> c_int {
++    unsafe {
++        // Defense in depth: caller (slot_family_attach via the
++        // LOAD_PROG dispatch) already called slots_ensure(slot+1).
++        // This check protects against a misuse from a future caller
++        // that forgets the grow step.
++        if slot >= slots_mut().len() {
++            pr_err!(
++                "bifrost_guest: uprobe slot[{}] out of range (len={})\n",
++                slot,
++                slots_mut().len()
++            );
++            return -(bindings::EINVAL as i32);
++        }
++        // Initialize the wrapper's slot field, then expose the consumer
++        // pointer for the kernel uprobe API.  The kernel only sees the
++        // consumer; our shared handler recovers `slot` via container-of.
++        let bp_ptr = slots_mut()[slot].uprobe.as_mut_ptr();
++        (*bp_ptr).slot = slot as u32;
++        let consumer: *mut bindings::uprobe_consumer = &mut (*bp_ptr).consumer as *mut _;
++        if consumer.is_null() {
++            pr_err!("bifrost_guest: usdt slot[{}] consumer ptr null\n", slot);
++            return -(bindings::EINVAL as i32);
++        }
++        let mut pc_off: u64 = 0;
++        let mut sema_off: u64 = 0;
++        let (task, pinned) = if !basename.is_empty() && basename[0] == b'/' {
++            let mut path_buf = [0u8; 257];
++            if basename.len() > 256 {
++                pr_err!(
++                    "bifrost_guest: usdt slot[{}] path too long ({} > 256): '{}'\n",
++                    slot,
++                    basename.len(),
++                    core::str::from_utf8(&basename[..256]).unwrap_or("?")
++                );
++                return -(bindings::EINVAL as i32);
++            }
++            let len = basename.len();
++            path_buf[..len].copy_from_slice(&basename[..len]);
++            let file = bindings::filp_open(
++                path_buf.as_ptr() as *const c_char,
++                bindings::O_RDONLY as c_int,
++                0,
++            );
++            let raw_file = file as isize;
++            if (-4096..0).contains(&raw_file) || file.is_null() {
++                pr_err!(
++                    "bifrost_guest: usdt slot[{}] open path '{}' failed: {}\n",
++                    slot,
++                    core::str::from_utf8(basename).unwrap_or("?"),
++                    raw_file
++                );
++                return if raw_file < 0 {
++                    raw_file as c_int
++                } else {
++                    -(bindings::ENOENT as i32)
++                };
++            }
++            let rc = bifrost_helper_resolve_usdt(
++                file,
++                sdt_provider.as_ptr(),
++                sdt_provider.len() as u32,
++                sdt_probe.as_ptr(),
++                sdt_probe.len() as u32,
++                &mut pc_off,
++                &mut sema_off,
++            );
++            if rc != 0 {
++                pr_err!(
++                    "bifrost_guest: usdt slot[{}] path resolve {}:{} on '{}' failed: {}\n",
++                    slot,
++                    core::str::from_utf8(sdt_provider).unwrap_or("?"),
++                    core::str::from_utf8(sdt_probe).unwrap_or("?"),
++                    core::str::from_utf8(basename).unwrap_or("?"),
++                    rc
++                );
++                fput(file);
++                return rc;
++            }
++            let pinned = igrab((*file).f_inode);
++            fput(file);
++            if pinned.is_null() {
++                pr_err!(
++                    "bifrost_guest: usdt slot[{}] path '{}' inode pin failed\n",
++                    slot,
++                    core::str::from_utf8(basename).unwrap_or("?")
++                );
++                return -(bindings::ENOENT as i32);
++            }
++            (core::ptr::null_mut(), pinned)
++        } else {
++            let task = find_task_by_comm(basename);
++            if task.is_null() {
++                pr_err!(
++                    "bifrost_guest: usdt slot[{}] no task with comm '{}'\n",
++                    slot,
++                    core::str::from_utf8(basename).unwrap_or("?")
++                );
++                return -(bindings::ENOENT as i32);
++            }
++            let exe = get_task_exe_file(task);
++            if exe.is_null() {
++                pr_err!("bifrost_guest: usdt slot[{}] task has no exe_file\n", slot);
++                put_task_ref(task);
++                return -(bindings::ENOENT as i32);
++            }
++            let rc = bifrost_helper_resolve_usdt(
++                exe,
++                sdt_provider.as_ptr(),
++                sdt_provider.len() as u32,
++                sdt_probe.as_ptr(),
++                sdt_probe.len() as u32,
++                &mut pc_off,
++                &mut sema_off,
++            );
++            if rc != 0 {
++                pr_err!(
++                    "bifrost_guest: usdt slot[{}] resolve {}:{} failed: {}\n",
++                    slot,
++                    core::str::from_utf8(sdt_provider).unwrap_or("?"),
++                    core::str::from_utf8(sdt_probe).unwrap_or("?"),
++                    rc
++                );
++                fput(exe);
++                put_task_ref(task);
++                return rc;
++            }
++            let exe_inode = (*exe).f_inode;
++            let pinned = igrab(exe_inode);
++            fput(exe);
++            (task, pinned)
++        };
++        pr_info!(
++            "bifrost_guest: usdt slot[{}] resolved {}:{} pc=+0x{:x} sema=+0x{:x}\n",
++            slot,
++            core::str::from_utf8(sdt_provider).unwrap_or("?"),
++            core::str::from_utf8(sdt_probe).unwrap_or("?"),
++            pc_off,
++            sema_off
++        );
++        // Push symtabs for the firing task's executable VMAs (same as the
++        // by-sym path) so any gustack() in the body symbolicates cleanly.
++        if !task.is_null() {
++            bifrost_helper_for_each_vma_file(
++                task,
++                Some(push_symtab_snapshot_cb),
++                core::ptr::null_mut(),
++            );
++            put_task_ref(task);
++        }
++        if pinned.is_null() {
++            pr_err!("bifrost_guest: usdt slot[{}] igrab returned NULL\n", slot);
++            return -(bindings::ENOENT as i32);
++        }
++        core::ptr::write_bytes(consumer, 0, 1);
++        // shared handler — slot recovered via container-of
++        (*consumer).handler = Some(bifrost_uprobe_handler);
++        let handle = uprobe_register(pinned, pc_off as i64, sema_off as i64, consumer);
++        let raw = handle as i64;
++        if (-4096..0).contains(&raw) || handle.is_null() {
++            pr_err!(
++                "bifrost_guest: usdt slot[{}] uprobe_register failed: {}\n",
++                slot,
++                raw
++            );
++            iput(pinned);
++            return if raw < 0 {
++                raw as c_int
++            } else {
++                -(bindings::EINVAL as i32)
++            };
++        }
++        slots_mut()[slot].uprobe_handle = handle;
++        slots_mut()[slot].uprobe_inode = pinned;
++        (*bg).kprobe_attached = true;
++        BIFROST_NUM_KPROBES = slot + 1;
++        pr_info!(
++            "bifrost_guest: usdt slot[{}] registered on {}:{}:{} pc=+0x{:x} sema=+0x{:x}\n",
++            slot,
++            core::str::from_utf8(basename).unwrap_or("?"),
++            core::str::from_utf8(sdt_provider).unwrap_or("?"),
++            core::str::from_utf8(sdt_probe).unwrap_or("?"),
++            pc_off,
++            sema_off
++        );
++        0
++    }
++}
++
++/// Register a host-resolved uprobe (PROBE_TYPE_UPROBE /
++/// URETPROBE).  The CLI ferried (path, file_offset) in the BFR7
++/// trailer.  Path resolution is two-stage:
++///
++///   1. Container-aware exe_file lookup via `find_task_by_comm`
++///      → `get_task_exe_file` → `igrab`.  Works for binaries that
++///      live only in a container's overlayfs (init's mount ns
++///      has no visibility there).
++///
++///   2. `kern_path` fallback with retry-with-backoff (handles
++///      the boot-order race where LOAD_PROG arrives at ~50ms
++///      while virtiofs hasn't finished mounting the rootfs yet).
++///
++/// Storage: when (1) succeeds, kpath stays zero and
++/// slots_mut()[slot].uprobe_path is left as the empty path; cleanup
++/// branches on dentry.is_null() to skip path_put.  The pinned
++/// inode (igrab'd from the file's f_inode) handles lifetime
++/// either way.
++///
++/// Symmetric to cleanup_slot_uprobe.
++unsafe fn attach_slot_uprobe(
++    slot: usize,
++    probe_type: u8,
++    name_str: &str,
++    uprobe_path_buf: &[u8; 257],
++    uprobe_file_offset: u64,
++    bg: *mut BifrostGuest,
++) -> c_int {
++    unsafe {
++        // Defense in depth: caller (slot_family_attach via the
++        // LOAD_PROG dispatch) already called slots_ensure(slot+1).
++        // This check protects against a misuse from a future caller
++        // that forgets the grow step.
++        if slot >= slots_mut().len() {
++            pr_err!(
++                "bifrost_guest: uprobe slot[{}] out of range (len={})\n",
++                slot,
++                slots_mut().len()
++            );
++            return -(bindings::EINVAL as i32);
++        }
++        // Initialize the wrapper's slot field, then expose the consumer
++        // pointer for the kernel uprobe API.  The kernel only sees the
++        // consumer; our shared handler recovers `slot` via container-of.
++        let bp_ptr = slots_mut()[slot].uprobe.as_mut_ptr();
++        (*bp_ptr).slot = slot as u32;
++        let consumer: *mut bindings::uprobe_consumer = &mut (*bp_ptr).consumer as *mut _;
++        if consumer.is_null() {
++            pr_err!("bifrost_guest: uprobe slot[{}] consumer ptr null\n", slot);
++            return -(bindings::EINVAL as i32);
++        }
++        let mut kpath: bindings::path = bindings::path {
++            mnt: core::ptr::null_mut(),
++            dentry: core::ptr::null_mut(),
++        };
++        let mut pinned: *mut bindings::inode = core::ptr::null_mut();
++        let mut resolved_via = "<unset>";
++
++        // Stage 1: exe_file via for_each_process.
++        let basename = path_basename(uprobe_path_buf);
++        if !basename.is_empty() {
++            let task = find_task_by_comm(basename);
++            if !task.is_null() {
++                let exe = get_task_exe_file(task);
++                put_task_ref(task);
++                if !exe.is_null() {
++                    let exe_inode = (*exe).f_inode;
++                    pinned = igrab(exe_inode);
++                    // Drop the file ref — the inode pin (igrab
++                    // refcount) is sufficient to keep the inode
++                    // alive for the lifetime of the uprobe.
++                    fput(exe);
++                    if !pinned.is_null() {
++                        resolved_via = "exe_file";
++                    }
++                }
++            }
++        }
++
++        // Stage 2: kern_path fallback with retry.
++        let mut rc: c_int = 0;
++        let mut attempts: u32 = 0;
++        if pinned.is_null() {
++            rc = -2; // -ENOENT
++            while attempts < 300 {
++                rc = kern_path(
++                    uprobe_path_buf.as_ptr() as *const c_char,
++                    1, // LOOKUP_FOLLOW
++                    &mut kpath,
++                );
++                if rc == 0 || rc != -2 {
++                    break;
++                }
++                // 100 ms = HZ/10 (HZ=1000 on most modern arm64 builds).
++                bindings::schedule_timeout_interruptible(100);
++                if bindings::kthread_should_stop() {
++                    break;
++                }
++                attempts += 1;
++            }
++            if rc == 0 {
++                let raw_inode = (*kpath.dentry).d_inode;
++                pinned = igrab(raw_inode);
++                if pinned.is_null() {
++                    path_put(&kpath);
++                    kpath.mnt = core::ptr::null_mut();
++                    kpath.dentry = core::ptr::null_mut();
++                } else {
++                    resolved_via = if attempts > 0 {
++                        "kern_path (after retries)"
++                    } else {
++                        "kern_path"
++                    };
++                }
++            }
++        }
++
++        if pinned.is_null() {
++            pr_err!(
++            "bifrost_guest: uprobe slot[{}] path resolution failed for '{}' (kern_path={} after {} retries; no task with matching comm)\n",
++            slot,
++            core::str::from_utf8(
++                &uprobe_path_buf[..uprobe_path_buf
++                    .iter()
++                    .position(|&b| b == 0)
++                    .unwrap_or(0)]
++            )
++            .unwrap_or("?"),
++            rc,
++            attempts
++        );
++            return if rc != 0 {
++                rc
++            } else {
++                -(bindings::ENOENT as i32)
++            };
++        }
++        pr_info!(
++            "bifrost_guest: uprobe slot[{}] resolved '{}' via {} (attempts={})\n",
++            slot,
++            core::str::from_utf8(
++                &uprobe_path_buf[..uprobe_path_buf.iter().position(|&b| b == 0).unwrap_or(0)]
++            )
++            .unwrap_or("?"),
++            resolved_via,
++            attempts
++        );
++        // Zero the consumer struct, then wire either entry or return
++        // handler based on probe_type.
++        core::ptr::write_bytes(consumer, 0, 1);
++        if probe_type == PROBE_TYPE_URETPROBE {
++            (*consumer).ret_handler = match slot {
++                // shared handler — slot recovered via container-of
++                _ => Some(bifrost_uretprobe_handler),
++            };
++        } else {
++            (*consumer).handler = match slot {
++                // shared handler — slot recovered via container-of
++                _ => Some(bifrost_uprobe_handler),
++            };
++        }
++        let handle = uprobe_register(
++            pinned,
++            uprobe_file_offset as i64,
++            0, // ref_ctr_offset — only USDT (attach_slot_usdt) uses non-zero
++            consumer,
++        );
++        let raw = handle as i64;
++        if (-4096..0).contains(&raw) || handle.is_null() {
++            pr_err!(
++                "bifrost_guest: uprobe_register slot[{}] failed: {}\n",
++                slot,
++                raw
++            );
++            iput(pinned);
++            if !kpath.dentry.is_null() {
++                path_put(&kpath);
++            }
++            return if raw < 0 {
++                raw as c_int
++            } else {
++                -(bindings::EINVAL as i32)
++            };
++        }
++        slots_mut()[slot].uprobe_handle = handle;
++        slots_mut()[slot].uprobe_inode = pinned;
++        slots_mut()[slot].uprobe_path = kpath;
++        (*bg).kprobe_attached = true;
++        BIFROST_NUM_KPROBES = slot + 1;
++        let kind = if probe_type == PROBE_TYPE_URETPROBE {
++            "uretprobe"
++        } else {
++            "uprobe"
++        };
++        pr_info!(
++            "bifrost_guest: {} slot[{}] registered on '{}' +0x{:x} -> {}\n",
++            kind,
++            slot,
++            core::str::from_utf8(
++                &uprobe_path_buf[..uprobe_path_buf.iter().position(|&b| b == 0).unwrap_or(0)]
++            )
++            .unwrap_or("?"),
++            uprobe_file_offset,
++            name_str
++        );
++        0
++    }
++}
++
++/// Tear down an FBT (FENTRY/FEXIT) trampoline link allocated in
++/// the per-slot static storage.  Symmetric to the LOAD_PROG arm
++/// at line ~600 that calls `bpf_trampoline_get` +
++/// `bpf_trampoline_link_prog` — we reverse it via
++/// `bpf_trampoline_unlink_prog` + `bpf_trampoline_put`.  The
++/// `bpf_link` itself was never exposed via fd, so its refcnt
++/// stays at the `bpf_link_init` default (1) and we don't
++/// `bpf_link_put`.
++unsafe fn cleanup_slot_fbt(s: usize) {
++    unsafe {
++        if !slots_mut()[s].fbt_linked {
++            return;
++        }
++        let link_p: *mut bindings::bpf_tracing_link = if (s as usize) < slots_mut().len() {
++            slots_mut()[s as usize].fbt_link.as_mut_ptr()
++        } else {
++            core::ptr::null_mut()
++        };
++        if !link_p.is_null() {
++            let tr = (*link_p).trampoline;
++            bindings::bpf_trampoline_unlink_prog(
++                &mut (*link_p).link as *mut bindings::bpf_tramp_link,
++                tr,
++                core::ptr::null_mut(),
++            );
++            if !tr.is_null() {
++                bindings::bpf_trampoline_put(tr);
++            }
++        }
++        slots_mut()[s].fbt_linked = false;
++    }
++}
++
++/// Tear down a raw-tracepoint registration in the per-slot static
++/// storage.  Symmetric to the LOAD_PROG arm: unregister the
++/// `bpf_raw_tp_link` from the tracepoint via
++/// `bpf_probe_unregister`, then drop the module ref taken at
++/// register time via `bpf_put_raw_tracepoint`.  The link is
++/// static storage (never exposed via fd), refcnt stays at 1 from
++/// `bpf_link_init`.
++unsafe fn cleanup_slot_tracepoint(s: usize) {
++    unsafe {
++        if !slots_mut()[s].rawtp_registered {
++            return;
++        }
++        let link_p: *mut bindings::bpf_raw_tp_link = if (s as usize) < slots_mut().len() {
++            slots_mut()[s as usize].rawtp_link.as_mut_ptr()
++        } else {
++            core::ptr::null_mut()
++        };
++        let btp = slots_mut()[s].rawtp_btp;
++        if !link_p.is_null() && !btp.is_null() {
++            let _ = bpf_probe_unregister(btp, link_p);
++            bpf_put_raw_tracepoint(btp);
++        }
++        slots_mut()[s].rawtp_btp = core::ptr::null_mut();
++        slots_mut()[s].rawtp_registered = false;
++    }
++}
++
++/// Tear down a uprobe registration (host- or kernel-resolved).
++/// Returns `true` if there was an active uprobe handle that we
++/// called `uprobe_unregister_nosync` on — the caller batches a
++/// single `uprobe_unregister_sync()` after the loop to drain
++/// outstanding handlers across all slots in one shot.  We also
++/// drop the inode pin (`iput`) and path ref (`path_put`) taken at
++/// register time.
++unsafe fn cleanup_slot_uprobe(s: usize) -> bool {
++    unsafe {
++        let mut had_uprobe = false;
++        let handle = slots_mut()[s].uprobe_handle;
++        let consumer: *mut bindings::uprobe_consumer = if s < slots_mut().len() {
++            let bp_ptr = slots_mut()[s].uprobe.as_mut_ptr();
++            &mut (*bp_ptr).consumer as *mut _
++        } else {
++            core::ptr::null_mut()
++        };
++        if !handle.is_null() && !consumer.is_null() {
++            uprobe_unregister_nosync(handle, consumer);
++            had_uprobe = true;
++        }
++        slots_mut()[s].uprobe_handle = core::ptr::null_mut();
++        let inode = slots_mut()[s].uprobe_inode;
++        if !inode.is_null() {
++            iput(inode);
++            slots_mut()[s].uprobe_inode = core::ptr::null_mut();
++        }
++        if !slots_mut()[s].uprobe_path.dentry.is_null() {
++            path_put(&slots_mut()[s].uprobe_path);
++            slots_mut()[s].uprobe_path = bindings::path {
++                mnt: core::ptr::null_mut(),
++                dentry: core::ptr::null_mut(),
++            };
++        }
++        had_uprobe
++    }
++}
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index cc44ab8ab2ac..cf61e5138982 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -27,17 +27,16 @@
+ //   control_reply.rs         LOAD_PROG completion + ctrl repost
+ //   shmem_init.rs            SHMEM_INIT event publication
+ //   uprobe_handlers.rs       shared uprobe/uretprobe dispatch
++//   attach.rs                probe-family attach + cleanup paths
+ //
+ // Pending (each requires a kernel rebuild + per-attach demo sweep
+ // to land safely; deferred until that build cycle is available):
+ //   load_prog/mod.rs         entry + phase orchestration
+ //   load_prog/maps.rs        map setup, fake-fd patching
+ //   load_prog/verifier.rs    BIFROST_USE_VERIFIER path
+-//   attach/mod.rs            dispatch on probe_type
+-//   attach/uprobe.rs         uprobe + uretprobe (file + symbol variants)
+-//   attach/fbt.rs            fentry/fexit (BPF trampoline)
+-//   attach/tracepoint.rs     raw tracepoint
+-//   cleanup.rs               per-handle teardown, atomic prog swap
++//   attach/uprobe.rs         split uprobe + uretprobe out of attach.rs
++//   attach/fbt.rs            split fentry/fexit out of attach.rs
++//   attach/tracepoint.rs     split raw tracepoint out of attach.rs
+ //
+ // The historical patch series in
+ // `third_party/smolvm/libkrunfw/patches/` already mirrors the
+@@ -67,6 +66,7 @@
+ 
+ mod bpf_consts;
+ mod agg_snapshot;
++mod attach;
+ mod control_reply;
+ mod kfunc_manifest;
+ mod load_prog_parse;
+@@ -90,9 +90,9 @@
+ #[allow(unreachable_pub)]
+ mod wire;
+ use agg_snapshot::push_agg_snapshot;
++use attach::{slot_family_attach, slot_family_cleanup, AttachExt};
+ use control_reply::complete_load_prog;
+ use load_prog_parse::validate_load_prog_cmd;
+-use path_helpers::path_basename;
+ use shmem_init::send_shmem_init;
+ use shmem_publish::{populate_shmem_btf, populate_shmem_kallsyms};
+ use slots::{
+@@ -100,9 +100,7 @@
+     INITIAL_SLOT_HINT,
+ };
+ use symtab_snapshot::push_symtab_snapshot_cb;
+-use task_helpers::{find_task_by_comm, put_task_ref};
+ use types::{BifrostCmd, BpfInsn, MapDef};
+-use uprobe_handlers::{bifrost_uprobe_handler, bifrost_uretprobe_handler};
+ use shmem_layout::{
+     SHMEM_BTF_CAP, SHMEM_BTF_OFF, SHMEM_HDR_LEN, SHMEM_HDR_OFF, SHMEM_KSYMS_CAP, SHMEM_KSYMS_OFF,
+     SHMEM_MAGIC, SHMEM_N_PAGES, SHMEM_REGION_SIZE, SHMEM_RINGBUF_LEN, SHMEM_RINGBUF_OFF,
+@@ -153,7 +151,7 @@ pub(crate) struct BifrostGuest {
+     pub(crate) maps: [*mut bindings::bpf_map; 8],
+     pub(crate) num_maps: u32,
+     // Kprobe tracking
+-    kprobe_attached: bool,
++    pub(crate) kprobe_attached: bool,
+     // SHMEM region. Prefer the virtio shared-memory region exposed by
+     // the VMM; fall back to the older vmalloc/PFN path for older VMMs.
+     shmem_va: *mut u8,
+@@ -227,7 +225,7 @@ unsafe fn map_bifrost_virtio_shmem(vdev: *mut bindings::virtio_device) -> *mut u
+ /// bpf_link_init+0x8 with a translation fault on virt addr 0x0/0x8.
+ /// All callbacks None → no spurious WARN, and they're never called
+ /// because we manage the link's lifecycle in-driver.
+-static mut BIFROST_TRACING_LINK_OPS: bindings::bpf_link_ops = bindings::bpf_link_ops {
++pub(crate) static mut BIFROST_TRACING_LINK_OPS: bindings::bpf_link_ops = bindings::bpf_link_ops {
+     release: None,
+     dealloc: None,
+     dealloc_deferred: None,
+@@ -286,114 +284,9 @@ unsafe fn map_bifrost_virtio_shmem(vdev: *mut bindings::virtio_device) -> *mut u
+     // (kprobe/kretprobe extern decls retired alongside the dispatch
+     // arms — fbt and tracepoint cover what the int3-based kprobe
+     // path used to reach.)
+-    // A4 — Uprobes. uprobe_register pins an inode + offset and writes a
+-    // breakpoint into the binary's text page; subsequent user-mode hits
+-    // call our consumer's handler. Unregister is two-step: nosync to
+-    // remove the consumer, then a single sync to wait for outstanding
+-    // handlers to drain. CONFIG_UPROBES=y is set in the build script.
+-    fn uprobe_register(
+-        inode: *mut bindings::inode,
+-        offset: i64,
+-        ref_ctr_offset: i64,
+-        uc: *mut bindings::uprobe_consumer,
+-    ) -> *mut bindings::uprobe;
+-    fn uprobe_unregister_nosync(
+-        uprobe: *mut bindings::uprobe,
+-        uc: *mut bindings::uprobe_consumer,
+-    );
++    // The per-slot uprobe unregister path lives in attach.rs; remove
++    // waits once after the loop to drain outstanding handlers.
+     fn uprobe_unregister_sync();
+-    // Path resolution (resolves a guest-visible path to a struct path
+-    // we can dereference for the inode). LOOKUP_FOLLOW=1 follows
+-    // symlinks; bare basenames + dynamic linker symlinks resolve fine.
+-    fn kern_path(
+-        name: *const c_char,
+-        flags: core::ffi::c_uint,
+-        path: *mut bindings::path,
+-    ) -> c_int;
+-    fn path_put(path: *const bindings::path);
+-    // Inode lifecycle — igrab pins (refcount++), iput releases. We hold
+-    // the pin for the lifetime of the uprobe registration; otherwise
+-    // the kernel could evict the inode out from under us.
+-    fn igrab(inode: *mut bindings::inode) -> *mut bindings::inode;
+-    fn iput(inode: *mut bindings::inode);
+-    // Container-aware fallback path resolution: walk the task list,
+-    // find a process whose comm matches the requested binary basename,
+-    // and grab its already-loaded exe_file. The kernel resolved the
+-    // exe_file at exec() time *inside the target task's mount
+-    // namespace*, so this works for binaries that live only in a
+-    // container's overlayfs (which `kern_path` running in init's mount
+-    // namespace cannot see).
+-    //
+-    // Both functions are defined in kernel/fork.c. Not EXPORT_SYMBOL'd
+-    // for modules, but bifrost-guest is built in-tree (CONFIG_BIFROST=y)
+-    // so it links directly without an export list.
+-    fn get_task_exe_file(task: *mut bindings::task_struct) -> *mut bindings::file;
+-    fn fput(file: *mut bindings::file);
+-    // bifrost_helper_find_task_by_comm extern decl moved to
+-    // drivers/bifrost/task_helpers.rs alongside find_task_by_comm.
+-    /// C helper — resolves a symbol name in the ELF symbol table of
+-    /// `file` (a task's exe_file) to its file offset.  Returns 0 on
+-    /// success and writes the offset/size to the out pointers; a
+-    /// negative errno on failure.  Only ELF64 LE / ET_DYN today;
+-    /// see drivers/bifrost/bifrost_helpers.c for the full contract.
+-    fn bifrost_helper_resolve_symbol(
+-        file: *mut bindings::file,
+-        symbol_name: *const u8,
+-        symbol_name_len: u32,
+-        out_file_offset: *mut u64,
+-        out_size: *mut u64,
+-    ) -> c_int;
+-    /// C helper — sister to bifrost_helper_resolve_symbol but for
+-    /// USDT (`.note.stapsdt`) probes.  Walks the section to find the
+-    /// first entry matching `(provider_name, probe_name)` and
+-    /// resolves both the probe pc and its `.probes` semaphore via
+-    /// PT_LOAD vaddr→file_offset translation.  Returns 0 on success
+-    /// and writes both offsets via the out pointers; the semaphore
+-    /// offset is 0 when the probe doesn't use one.  Negative errno
+-    /// on failure (`-ENOENT` if the section / entry isn't present).
+-    fn bifrost_helper_resolve_usdt(
+-        file: *mut bindings::file,
+-        provider_name: *const u8,
+-        provider_name_len: u32,
+-        probe_name: *const u8,
+-        probe_name_len: u32,
+-        out_pc_file_offset: *mut u64,
+-        out_semaphore_file_offset: *mut u64,
+-    ) -> c_int;
+-    /// C helper — walk `task->mm`'s file-backed executable VMAs and
+-    /// invoke `cb(file, ctx)` for each unique `vm_file`.  Used by the
+-    /// uprobe register path to push symtabs for every binary the
+-    /// firing task has mapped, not just the one we put a uprobe on
+-    /// (so libc / libpthread / vDSO frames in gustack output
+-    /// symbolicate too).  Sleepable (does mmap_read_lock + d_path
+-    /// inside the cb's downstream calls); must not be called from
+-    /// kprobe / BPF context.
+-    fn bifrost_helper_for_each_vma_file(
+-        task: *mut bindings::task_struct,
+-        cb: Option<unsafe extern "C" fn(*mut bindings::file, *mut c_void)>,
+-        ctx: *mut c_void,
+-    );
+-    // Timing
+-    fn ktime_get_mono_fast_ns() -> u64;
+-    // libc strlen — needed in the kallsyms walker callback to size each
+-    // symbol name without scanning twice.
+-    fn strlen(s: *const c_char) -> usize;
+-    // Raw tracepoint attach.  Resolve the per-event bpf_raw_event_map
+-    // by name (kernel walks __start__bpf_raw_tp[..] + module list);
+-    // register a bpf_raw_tp_link wrapping the prog so per-event
+-    // dispatch enters via btp->bpf_func → __bpf_trace_run → prog.
+-    // Symmetric unregister pairs with bpf_put_raw_tracepoint to drop
+-    // the module ref taken by the lookup.
+-    fn bpf_get_raw_tracepoint(name: *const c_char) -> *mut bindings::bpf_raw_event_map;
+-    fn bpf_put_raw_tracepoint(btp: *mut bindings::bpf_raw_event_map);
+-    fn bpf_probe_register(
+-        btp: *mut bindings::bpf_raw_event_map,
+-        link: *mut bindings::bpf_raw_tp_link,
+-    ) -> c_int;
+-    fn bpf_probe_unregister(
+-        btp: *mut bindings::bpf_raw_event_map,
+-        link: *mut bindings::bpf_raw_tp_link,
+-    ) -> c_int;
+ }
+ 
+ // NOTE: bifrost_ringbuf_reserve/bifrost_ringbuf_submit (the custom
+@@ -497,7 +390,7 @@ pub(crate) unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
+     }
+ }
+ 
+-unsafe fn free_slot_prog(slot: usize) {
++pub(crate) unsafe fn free_slot_prog(slot: usize) {
+     unsafe {
+         if slot >= slots_mut().len() {
+             return;
+@@ -1691,1013 +1584,6 @@ extern "C" fn bifrost_probe(vdev: *mut bindings::virtio_device) -> c_int {
+     }
+ }
+ 
+-// Per-slot attach + cleanup arms.  Each pair of helpers
+-// (attach_slot_<kind> + cleanup_slot_<kind>) handles ONE
+-// probe-type's teardown / register-and-attach for a single slot
+-// index.  The dispatch loop in the LOAD_PROG worker calls the
+-// attach side; bifrost_remove calls the cleanup side.  Splitting
+-// each arm out keeps both flows readable (each block was 100+
+-// lines deeply nested in a 1300-line worker body) and gives
+-// reviewers a single place to audit reverse-order discipline:
+-// every refcount the attach arm acquires, the cleanup arm drops.
+-
+-/// Register a JIT'd FBT (FENTRY/FEXIT) prog by linking it into
+-/// the BPF trampoline the verifier resolved for us.
+-///
+-/// The verifier's `check_attach_btf_id` path populated
+-/// `prog->aux->dst_trampoline` (via `bpf_check_attach_target` +
+-/// `bpf_trampoline_get`) when we set `type=TRACING +
+-/// attach_btf_id` and routed through `bifrost_set_prog_type`
+-/// before `bifrost_verify_prog`.  We:
+-///   1. Init a per-slot `bpf_tracing_link`
+-///   2. Point it at the JIT'd prog + dst_trampoline
+-///   3. `bpf_trampoline_link_prog` inserts the link into the
+-///      trampoline's hlist — the next call into the target
+-///      function hits the trampoline and runs our prog.
+-///
+-// =====================================================================
+-// Probe-family dispatch (Phase D).
+-//
+-// Today's `match probe_type` happens at three sites:
+-//   - LOAD_PROG attach loop (line ~1842): selects which
+-//     `attach_slot_*` to call.
+-//   - bifrost_remove cleanup (line ~2948): selects which
+-//     `cleanup_slot_*` to call.
+-//   - host CLI wrapper builder (host/bifrost/src/cli/wrapper.rs):
+-//     selects which trailer shape to emit.
+-//
+-// The three matches are coupled — adding a new probe family means
+-// editing all three plus the wire-format const + the per-family
+-// register/unregister paths.  Phase D collapses the kernel-side two
+-// matches into single dispatch helpers with a single arm per
+-// family.  Adding a new family is one new arm in three places
+-// (slot_family_attach / _cleanup / _label) plus a new
+-// attach_slot_<family> + cleanup_slot_<family>.  No more parallel
+-// match arms drifting out of sync.
+-//
+-// Note: this is the kernel-rust-friendly shape — `match`-based
+-// dispatch rather than `&'static dyn AttachOps`.  Kernel-rust
+-// supports `dyn Trait` but the existing driver uses no dyn, so
+-// staying with concrete dispatch keeps the add-one-family delta
+-// tighter and the codegen friendlier.
+-
+-/// Inputs for `slot_family_attach` — the union of arguments every
+-/// `attach_slot_*` function needs.  Each family pulls only the
+-/// fields it cares about.  Borrowed by `'a` against the LOAD_PROG
+-/// worker's stack-resident parse buffer.
+-struct AttachExt<'a> {
+-    name_str: &'a str,
+-    target_name: [u8; 32],
+-    uprobe_basename: &'a [u8],
+-    uprobe_symbol: &'a [u8],
+-    uprobe_provider: &'a [u8],
+-    uprobe_path_buf: &'a [u8; 257],
+-    uprobe_file_offset: u64,
+-}
+-
+-/// Centralized attach dispatch.  Allocates a fresh slot lease,
+-/// stores it in `slots_mut()[slot].lease`, then forwards to the
+-/// per-family attach.  The lease is issued *before* dispatch so a
+-/// failed attach still has a recorded lease for diagnostics; the
+-/// cleanup path tolerates `lease == 0` for slots that never got
+-/// attached.
+-///
+-/// Returns 0 on success or a negative errno from the per-family attach.
+-/// On failure, the JIT'd program stored in the slot is released and the
+-/// lease is cleared so the worker can report truthful LOAD_PROG status.
+-unsafe fn slot_family_attach(
+-    slot: usize,
+-    probe_type: u8,
+-    bg: *mut BifrostGuest,
+-    ext: &AttachExt<'_>,
+-) -> c_int {
+-    unsafe {
+-        // Heap-migration: grow the slot table here so the
+-        // family-specific attach below can index slot N safely.
+-        // The LOAD_PROG dispatch already grew before reaching us
+-        // for the common case; this is the defensive grow that
+-        // covers any future caller path.
+-        if slots_ensure(slot + 1).is_err() {
+-            pr_err!("bifrost_guest: slot table grow to len={} failed in slot_family_attach\n", slot + 1);
+-            return -(bindings::ENOMEM as i32);
+-        }
+-        slots_mut()[slot].lease = slot_lease_new();
+-        let rc = match probe_type {
+-            PROBE_TYPE_FENTRY | PROBE_TYPE_FEXIT => {
+-                attach_slot_fbt(slot, probe_type, ext.name_str, bg)
+-            }
+-            PROBE_TYPE_TRACEPOINT => {
+-                attach_slot_tracepoint(slot, ext.name_str, bg)
+-            }
+-            PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => {
+-                attach_slot_uprobe(
+-                    slot,
+-                    probe_type,
+-                    ext.name_str,
+-                    ext.uprobe_path_buf,
+-                    ext.uprobe_file_offset,
+-                    bg,
+-                )
+-            }
+-            PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => {
+-                attach_slot_uprobe_by_sym(
+-                    slot,
+-                    probe_type,
+-                    ext.uprobe_basename,
+-                    ext.uprobe_symbol,
+-                    bg,
+-                )
+-            }
+-            PROBE_TYPE_USDT => {
+-                attach_slot_usdt(
+-                    slot,
+-                    ext.uprobe_basename,
+-                    ext.uprobe_provider,
+-                    ext.uprobe_symbol,
+-                    bg,
+-                )
+-            }
+-            _ => {
+-                pr_err!(
+-                    "bifrost_guest: unsupported probe_type {} for target='{}' slot[{}] — bifrost driver no longer dispatches kprobe (probe_types 0/1)\n",
+-                    probe_type,
+-                    ext.name_str,
+-                    slot
+-                );
+-                -(bindings::EINVAL as i32)
+-            }
+-        };
+-        if rc != 0 {
+-            free_slot_prog(slot);
+-            slots_mut()[slot].lease = 0;
+-        }
+-        rc
+-    }
+-}
+-
+-/// Centralized cleanup dispatch.  Returns true if the slot was a
+-/// uprobe family member (so the caller can run the batched
+-/// `uprobe_unregister_sync()` once at the end), false otherwise.
+-/// Mirrors the cleanup match in `bifrost_remove` line-for-line;
+-/// adding a new family adds an arm here and a matching attach arm.
+-unsafe fn slot_family_cleanup(slot: usize, probe_type: u8) -> bool {
+-    unsafe {
+-        let had_uprobe = match probe_type {
+-            PROBE_TYPE_FENTRY | PROBE_TYPE_FEXIT => {
+-                cleanup_slot_fbt(slot);
+-                false
+-            }
+-            PROBE_TYPE_TRACEPOINT => {
+-                cleanup_slot_tracepoint(slot);
+-                false
+-            }
+-            PROBE_TYPE_UPROBE
+-            | PROBE_TYPE_URETPROBE
+-            | PROBE_TYPE_UPROBE_BY_SYM
+-            | PROBE_TYPE_URETPROBE_BY_SYM
+-            | PROBE_TYPE_USDT => cleanup_slot_uprobe(slot),
+-            PROBE_TYPE_NONE => false,
+-            other => {
+-                pr_err!(
+-                    "bifrost_guest: cleanup slot[{}]: unknown probe_type {} (kprobe paths retired)\n",
+-                    slot,
+-                    other
+-                );
+-                false
+-            }
+-        };
+-        // Cleanup never grows; just zero the lease if the slot
+-        // index is in range.  After the heap migration, the table
+-        // length covers every attached slot by construction.
+-        if slot < slots_mut().len() {
+-            slots_mut()[slot].lease = 0;
+-        }
+-        had_uprobe
+-    }
+-}
+-
+-/// Short string label for the family that owns `probe_type`.
+-/// Used by Phase H emit in a follow-up; today only diagnostic.
+-#[allow(dead_code)]
+-fn slot_family_label(probe_type: u8) -> &'static str {
+-    match probe_type {
+-        PROBE_TYPE_FENTRY | PROBE_TYPE_FEXIT => "fbt",
+-        PROBE_TYPE_TRACEPOINT => "tracepoint",
+-        PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => "uprobe",
+-        PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => "uprobe_by_sym",
+-        PROBE_TYPE_USDT => "usdt",
+-        PROBE_TYPE_NONE => "none",
+-        _ => "unknown",
+-    }
+-}
+-
+-/// On any error the JIT'd prog is freed and the slot stays
+-/// unattached (cleanup_slot_fbt then no-ops).
+-unsafe fn attach_slot_fbt(
+-    slot: usize,
+-    probe_type: u8,
+-    name_str: &str,
+-    bg: *mut BifrostGuest,
+-) -> c_int {
+-    unsafe {
+-    let kind = if probe_type == PROBE_TYPE_FENTRY {
+-        "fentry"
+-    } else {
+-        "fexit"
+-    };
+-    let attach_type: u32 = if probe_type == PROBE_TYPE_FENTRY {
+-        24 // BPF_TRACE_FENTRY
+-    } else {
+-        25 // BPF_TRACE_FEXIT
+-    };
+-    let jitted = slots_mut()[slot].prog.load(Ordering::Acquire);
+-    let tr = if jitted.is_null() || (*jitted).aux.is_null() {
+-        core::ptr::null_mut()
+-    } else {
+-        (*(*jitted).aux).dst_trampoline
+-    };
+-    if jitted.is_null() || tr.is_null() {
+-        pr_err!(
+-            "bifrost_guest: {} slot[{}] target='{}': dst_trampoline missing — verifier didn't resolve attach target (BTF lookup failed?)\n",
+-            kind, slot, name_str
+-        );
+-        return -(bindings::EINVAL as i32);
+-    }
+-    let link_p: *mut bindings::bpf_tracing_link = if (slot as usize) < slots_mut().len() {
+-        slots_mut()[slot as usize].fbt_link.as_mut_ptr()
+-    } else { core::ptr::null_mut() };
+-    if link_p.is_null() {
+-        pr_err!("bifrost_guest: {} slot[{}] OOB\n", kind, slot);
+-        return -(bindings::EINVAL as i32);
+-    }
+-    core::ptr::write_bytes(link_p, 0, 1);
+-    // bpf_link_init takes a const ops ptr.  We pass our static
+-    // BIFROST_TRACING_LINK_OPS — the link is never exposed via
+-    // fd, but bpf_link_init derefs ops->dealloc & ops->
+-    // dealloc_deferred unconditionally so the ops ptr can't be
+-    // NULL.  Cleanup happens via direct
+-    // bpf_trampoline_unlink_prog + bpf_trampoline_put in
+-    // cleanup_slot_fbt.
+-    bindings::bpf_link_init(
+-        &mut (*link_p).link.link as *mut bindings::bpf_link,
+-        2, // BPF_LINK_TYPE_TRACING
+-        &BIFROST_TRACING_LINK_OPS as *const bindings::bpf_link_ops,
+-        jitted,
+-    );
+-    (*link_p).attach_type = attach_type;
+-    (*link_p).trampoline = tr;
+-    (*link_p).tgt_prog = core::ptr::null_mut();
+-    let lret = bindings::bpf_trampoline_link_prog(
+-        &mut (*link_p).link as *mut bindings::bpf_tramp_link,
+-        tr,
+-        core::ptr::null_mut(),
+-    );
+-    if lret == 0 {
+-        slots_mut()[slot].fbt_linked = true;
+-        BIFROST_NUM_KPROBES = slot + 1;
+-        // kprobe_attached is the "any probe attached" master
+-        // flag that gates cleanup; set it so bifrost_remove walks
+-        // our trampoline-link cleanup arm.
+-        (*bg).kprobe_attached = true;
+-        pr_info!(
+-            "bifrost_guest: {} slot[{}] linked to trampoline for '{}'\n",
+-            kind, slot, name_str
+-        );
+-    } else {
+-        pr_err!(
+-            "bifrost_guest: {} slot[{}] bpf_trampoline_link_prog failed: {}\n",
+-            kind, slot, lret
+-        );
+-        return lret;
+-    }
+-    0
+-    }
+-}
+-
+-/// Register a JIT'd raw-tracepoint prog by resolving the event
+-/// name via `bpf_get_raw_tracepoint` and inserting our per-slot
+-/// `bpf_raw_tp_link` via `bpf_probe_register`.
+-///
+-/// `target_name` carries just the tracepoint name (category is
+-/// implicit — `bpf_get_raw_tracepoint` walks the
+-/// `__start__bpf_raw_tp[..]` table flat).
+-///
+-/// On any error the JIT'd prog is freed and any acquired btp
+-/// reference is dropped (`bpf_put_raw_tracepoint`) before
+-/// returning.  Symmetric to cleanup_slot_tracepoint.
+-unsafe fn attach_slot_tracepoint(slot: usize, name_str: &str, bg: *mut BifrostGuest) -> c_int {
+-    unsafe {
+-    let jitted = slots_mut()[slot].prog.load(Ordering::Acquire);
+-    if jitted.is_null() {
+-        pr_err!(
+-            "bifrost_guest: tracepoint slot[{}]: prog NULL after JIT\n",
+-            slot
+-        );
+-        return -(bindings::EINVAL as i32);
+-    }
+-    let btp = bpf_get_raw_tracepoint(slots_mut()[slot].target_name.as_ptr() as *const _);
+-    if btp.is_null() {
+-        pr_err!(
+-            "bifrost_guest: tracepoint slot[{}] event '{}' not found in kernel tracepoint table\n",
+-            slot, name_str
+-        );
+-        return -(bindings::ENOENT as i32);
+-    }
+-    let link_p: *mut bindings::bpf_raw_tp_link = if (slot as usize) < slots_mut().len() {
+-        slots_mut()[slot as usize].rawtp_link.as_mut_ptr()
+-    } else { core::ptr::null_mut() };
+-    if link_p.is_null() {
+-        pr_err!("bifrost_guest: tracepoint slot[{}] OOB\n", slot);
+-        bpf_put_raw_tracepoint(btp);
+-        return -(bindings::EINVAL as i32);
+-    }
+-    core::ptr::write_bytes(link_p, 0, 1);
+-    // bpf_link_init: same all-None ops table as the tracing-link
+-    // case; bpf_link_init derefs ops->dealloc & ops->
+-    // dealloc_deferred so the ops ptr can't be NULL.
+-    bindings::bpf_link_init(
+-        &mut (*link_p).link as *mut bindings::bpf_link,
+-        9, // BPF_LINK_TYPE_RAW_TRACEPOINT
+-        &BIFROST_TRACING_LINK_OPS as *const bindings::bpf_link_ops,
+-        jitted,
+-    );
+-    (*link_p).btp = btp;
+-    let lret = bpf_probe_register(btp, link_p);
+-    if lret == 0 {
+-        slots_mut()[slot].rawtp_btp = btp;
+-        slots_mut()[slot].rawtp_registered = true;
+-        BIFROST_NUM_KPROBES = slot + 1;
+-        (*bg).kprobe_attached = true;
+-        pr_info!(
+-            "bifrost_guest: tracepoint slot[{}] attached to event '{}'\n",
+-            slot, name_str
+-        );
+-    } else {
+-        pr_err!(
+-            "bifrost_guest: tracepoint slot[{}] bpf_probe_register failed: {}\n",
+-            slot, lret
+-        );
+-        bpf_put_raw_tracepoint(btp);
+-        return lret;
+-    }
+-    0
+-    }
+-}
+-
+-/// Register a kernel-resolved uprobe (PROBE_TYPE_UPROBE_BY_SYM /
+-/// URETPROBE_BY_SYM).  The CLI ferried only (basename, symbol)
+-/// in the BFR7 trailer; we walk for_each_process to find a task
+-/// whose `comm` matches the basename, grab its already-mapped
+-/// exe_file, parse the ELF symtab for `symbol`, and register the
+-/// uprobe at the resolved file offset.
+-///
+-/// On the way: `bifrost_helper_for_each_vma_file` pushes
+-/// per-binary function symtabs to the host so the gustack
+-/// renderer can symbolicate frames without reading any ELF off
+-/// a host-mirrored rootfs.
+-///
+-/// Symmetric to cleanup_slot_uprobe.
+-unsafe fn attach_slot_uprobe_by_sym(
+-    slot: usize,
+-    probe_type: u8,
+-    basename: &[u8],
+-    symbol: &[u8],
+-    bg: *mut BifrostGuest,
+-) -> c_int {
+-    unsafe {
+-    // Defense in depth: caller (slot_family_attach via the
+-    // LOAD_PROG dispatch) already called slots_ensure(slot+1).
+-    // This check protects against a misuse from a future caller
+-    // that forgets the grow step.
+-    if slot >= slots_mut().len() {
+-        pr_err!("bifrost_guest: uprobe slot[{}] out of range (len={})\n", slot, slots_mut().len());
+-        return -(bindings::EINVAL as i32);
+-    }
+-    // Initialize the wrapper's slot field, then expose the consumer
+-    // pointer for the kernel uprobe API.  The kernel only sees the
+-    // consumer; our shared handler recovers `slot` via container-of.
+-    let bp_ptr = slots_mut()[slot].uprobe.as_mut_ptr();
+-    (*bp_ptr).slot = slot as u32;
+-    let consumer: *mut bindings::uprobe_consumer = &mut (*bp_ptr).consumer as *mut _;
+-    if consumer.is_null() {
+-        pr_err!(
+-            "bifrost_guest: uprobe-by-sym slot[{}] consumer ptr null\n",
+-            slot
+-        );
+-        return -(bindings::EINVAL as i32);
+-    }
+-    let task = find_task_by_comm(basename);
+-    if task.is_null() {
+-        pr_err!(
+-            "bifrost_guest: uprobe-by-sym slot[{}] no task with comm '{}'\n",
+-            slot,
+-            core::str::from_utf8(basename).unwrap_or("?")
+-        );
+-        return -(bindings::ENOENT as i32);
+-    }
+-    let exe = get_task_exe_file(task);
+-    if exe.is_null() {
+-        pr_err!(
+-            "bifrost_guest: uprobe-by-sym slot[{}] task has no exe_file\n",
+-            slot
+-        );
+-        put_task_ref(task);
+-        return -(bindings::ENOENT as i32);
+-    }
+-    let mut sym_off: u64 = 0;
+-    let mut sym_size: u64 = 0;
+-    let rc = bifrost_helper_resolve_symbol(
+-        exe,
+-        symbol.as_ptr(),
+-        symbol.len() as u32,
+-        &mut sym_off,
+-        &mut sym_size,
+-    );
+-    if rc != 0 {
+-        pr_err!(
+-            "bifrost_guest: uprobe-by-sym slot[{}] resolve '{}' failed: {}\n",
+-            slot,
+-            core::str::from_utf8(symbol).unwrap_or("?"),
+-            rc
+-        );
+-        fput(exe);
+-        put_task_ref(task);
+-        return rc;
+-    }
+-    pr_info!(
+-        "bifrost_guest: uprobe-by-sym slot[{}] resolved '{}'+0x{:x} (size={})\n",
+-        slot,
+-        core::str::from_utf8(symbol).unwrap_or("?"),
+-        sym_off,
+-        sym_size
+-    );
+-    // Side-channel: push function symtabs for the firing task's
+-    // executable VMAs to the host so its gustack renderer can
+-    // symbolicate frames without reading any ELF off a
+-    // host-mirrored rootfs.  Walks task->mm's VMAs (sleepable;
+-    // we're in the worker thread's LOAD_PROG handler, not BPF/
+-    // kprobe context) and pushes one record per unique vm_file —
+-    // covers the uprobed binary AND libc/libpthread/vDSO mapped
+-    // into the same task, so the bottom frames of gustack
+-    // symbolicate too.
+-    bifrost_helper_for_each_vma_file(
+-        task,
+-        Some(push_symtab_snapshot_cb),
+-        core::ptr::null_mut(),
+-    );
+-    put_task_ref(task);
+-    let exe_inode = (*exe).f_inode;
+-    let pinned = igrab(exe_inode);
+-    fput(exe);
+-    if pinned.is_null() {
+-        pr_err!(
+-            "bifrost_guest: uprobe-by-sym slot[{}] igrab returned NULL\n",
+-            slot
+-        );
+-        return -(bindings::ENOENT as i32);
+-    }
+-    // Reuse the same consumer-build + uprobe_register path used
+-    // for host-resolved uprobes by dispatching on the *_BY_SYM
+-    // variants when assigning the handler.
+-    core::ptr::write_bytes(consumer, 0, 1);
+-    if probe_type == PROBE_TYPE_URETPROBE_BY_SYM {
+-        (*consumer).ret_handler = match slot {
+-// shared handler — slot recovered via container-of
+-            _ => Some(bifrost_uretprobe_handler),
+-        };
+-    } else {
+-        (*consumer).handler = match slot {
+-// shared handler — slot recovered via container-of
+-            _ => Some(bifrost_uprobe_handler),
+-        };
+-    }
+-    let handle = uprobe_register(pinned, sym_off as i64, 0, consumer);
+-    let raw = handle as i64;
+-    if (-4096..0).contains(&raw) || handle.is_null() {
+-        pr_err!(
+-            "bifrost_guest: uprobe-by-sym slot[{}] uprobe_register failed: {}\n",
+-            slot, raw
+-        );
+-        iput(pinned);
+-        return if raw < 0 { raw as c_int } else { -(bindings::EINVAL as i32) };
+-    }
+-    slots_mut()[slot].uprobe_handle = handle;
+-    slots_mut()[slot].uprobe_inode = pinned;
+-    (*bg).kprobe_attached = true;
+-    BIFROST_NUM_KPROBES = slot + 1;
+-    let kind = if probe_type == PROBE_TYPE_URETPROBE_BY_SYM {
+-        "uretprobe"
+-    } else {
+-        "uprobe"
+-    };
+-    pr_info!(
+-        "bifrost_guest: {} slot[{}] (by-sym) registered on {}:{} +0x{:x} (sym_size={})\n",
+-        kind,
+-        slot,
+-        core::str::from_utf8(basename).unwrap_or("?"),
+-        core::str::from_utf8(symbol).unwrap_or("?"),
+-        sym_off,
+-        sym_size
+-    );
+-    0
+-    }
+-}
+-
+-/// Register a kernel-resolved USDT (PROBE_TYPE_USDT).  The CLI
+-/// ferried `(basename, sdt_provider, sdt_probe)` in the BFR7
+-/// trailer; we find the matching task by `comm == basename`, grab
+-/// its `exe_file`, and call `bifrost_helper_resolve_usdt` to walk
+-/// `.note.stapsdt`.  Symmetric to attach_slot_uprobe_by_sym but
+-/// targeting the SDT note section rather than `.symtab`.
+-///
+-/// The semaphore offset returned by the helper is non-zero on
+-/// SystemTap-style USDT probes (postgres-built-with-`--enable-dtrace`,
+-/// libstapsdt, glibc); we hand it to `uprobe_register` as
+-/// `ref_ctr_offset` so the kernel atomically increments the per-probe
+-/// `unsigned short` flag in `.probes` on attach.  Without that the
+-/// `STAP_PROBE` macro body short-circuits (no consumer registered)
+-/// and the NOP at `pc` never gets executed.
+-unsafe fn attach_slot_usdt(
+-    slot: usize,
+-    basename: &[u8],
+-    sdt_provider: &[u8],
+-    sdt_probe: &[u8],
+-    bg: *mut BifrostGuest,
+-) -> c_int {
+-    unsafe {
+-    // Defense in depth: caller (slot_family_attach via the
+-    // LOAD_PROG dispatch) already called slots_ensure(slot+1).
+-    // This check protects against a misuse from a future caller
+-    // that forgets the grow step.
+-    if slot >= slots_mut().len() {
+-        pr_err!("bifrost_guest: uprobe slot[{}] out of range (len={})\n", slot, slots_mut().len());
+-        return -(bindings::EINVAL as i32);
+-    }
+-    // Initialize the wrapper's slot field, then expose the consumer
+-    // pointer for the kernel uprobe API.  The kernel only sees the
+-    // consumer; our shared handler recovers `slot` via container-of.
+-    let bp_ptr = slots_mut()[slot].uprobe.as_mut_ptr();
+-    (*bp_ptr).slot = slot as u32;
+-    let consumer: *mut bindings::uprobe_consumer = &mut (*bp_ptr).consumer as *mut _;
+-    if consumer.is_null() {
+-        pr_err!("bifrost_guest: usdt slot[{}] consumer ptr null\n", slot);
+-        return -(bindings::EINVAL as i32);
+-    }
+-    let mut pc_off: u64 = 0;
+-    let mut sema_off: u64 = 0;
+-    let (task, pinned) = if !basename.is_empty() && basename[0] == b'/' {
+-        let mut path_buf = [0u8; 257];
+-        if basename.len() > 256 {
+-            pr_err!(
+-                "bifrost_guest: usdt slot[{}] path too long ({} > 256): '{}'\n",
+-                slot,
+-                basename.len(),
+-                core::str::from_utf8(&basename[..256]).unwrap_or("?")
+-            );
+-            return -(bindings::EINVAL as i32);
+-        }
+-        let len = basename.len();
+-        path_buf[..len].copy_from_slice(&basename[..len]);
+-        let file = bindings::filp_open(
+-            path_buf.as_ptr() as *const c_char,
+-            bindings::O_RDONLY as c_int,
+-            0,
+-        );
+-        let raw_file = file as isize;
+-        if (-4096..0).contains(&raw_file) || file.is_null() {
+-            pr_err!(
+-                "bifrost_guest: usdt slot[{}] open path '{}' failed: {}\n",
+-                slot,
+-                core::str::from_utf8(basename).unwrap_or("?"),
+-                raw_file
+-            );
+-            return if raw_file < 0 { raw_file as c_int } else { -(bindings::ENOENT as i32) };
+-        }
+-        let rc = bifrost_helper_resolve_usdt(
+-            file,
+-            sdt_provider.as_ptr(),
+-            sdt_provider.len() as u32,
+-            sdt_probe.as_ptr(),
+-            sdt_probe.len() as u32,
+-            &mut pc_off,
+-            &mut sema_off,
+-        );
+-        if rc != 0 {
+-            pr_err!(
+-                "bifrost_guest: usdt slot[{}] path resolve {}:{} on '{}' failed: {}\n",
+-                slot,
+-                core::str::from_utf8(sdt_provider).unwrap_or("?"),
+-                core::str::from_utf8(sdt_probe).unwrap_or("?"),
+-                core::str::from_utf8(basename).unwrap_or("?"),
+-                rc
+-            );
+-            fput(file);
+-            return rc;
+-        }
+-        let pinned = igrab((*file).f_inode);
+-        fput(file);
+-        if pinned.is_null() {
+-            pr_err!(
+-                "bifrost_guest: usdt slot[{}] path '{}' inode pin failed\n",
+-                slot,
+-                core::str::from_utf8(basename).unwrap_or("?")
+-            );
+-            return -(bindings::ENOENT as i32);
+-        }
+-        (core::ptr::null_mut(), pinned)
+-    } else {
+-        let task = find_task_by_comm(basename);
+-        if task.is_null() {
+-            pr_err!(
+-                "bifrost_guest: usdt slot[{}] no task with comm '{}'\n",
+-                slot,
+-                core::str::from_utf8(basename).unwrap_or("?")
+-            );
+-            return -(bindings::ENOENT as i32);
+-        }
+-        let exe = get_task_exe_file(task);
+-        if exe.is_null() {
+-            pr_err!("bifrost_guest: usdt slot[{}] task has no exe_file\n", slot);
+-            put_task_ref(task);
+-            return -(bindings::ENOENT as i32);
+-        }
+-        let rc = bifrost_helper_resolve_usdt(
+-            exe,
+-            sdt_provider.as_ptr(),
+-            sdt_provider.len() as u32,
+-            sdt_probe.as_ptr(),
+-            sdt_probe.len() as u32,
+-            &mut pc_off,
+-            &mut sema_off,
+-        );
+-        if rc != 0 {
+-            pr_err!(
+-                "bifrost_guest: usdt slot[{}] resolve {}:{} failed: {}\n",
+-                slot,
+-                core::str::from_utf8(sdt_provider).unwrap_or("?"),
+-                core::str::from_utf8(sdt_probe).unwrap_or("?"),
+-                rc
+-            );
+-            fput(exe);
+-            put_task_ref(task);
+-            return rc;
+-        }
+-        let exe_inode = (*exe).f_inode;
+-        let pinned = igrab(exe_inode);
+-        fput(exe);
+-        (task, pinned)
+-    };
+-    pr_info!(
+-        "bifrost_guest: usdt slot[{}] resolved {}:{} pc=+0x{:x} sema=+0x{:x}\n",
+-        slot,
+-        core::str::from_utf8(sdt_provider).unwrap_or("?"),
+-        core::str::from_utf8(sdt_probe).unwrap_or("?"),
+-        pc_off, sema_off
+-    );
+-    // Push symtabs for the firing task's executable VMAs (same as the
+-    // by-sym path) so any gustack() in the body symbolicates cleanly.
+-    if !task.is_null() {
+-        bifrost_helper_for_each_vma_file(
+-            task,
+-            Some(push_symtab_snapshot_cb),
+-            core::ptr::null_mut(),
+-        );
+-        put_task_ref(task);
+-    }
+-    if pinned.is_null() {
+-        pr_err!("bifrost_guest: usdt slot[{}] igrab returned NULL\n", slot);
+-        return -(bindings::ENOENT as i32);
+-    }
+-    core::ptr::write_bytes(consumer, 0, 1);
+-// shared handler — slot recovered via container-of
+-    (*consumer).handler = Some(bifrost_uprobe_handler);
+-    let handle = uprobe_register(
+-        pinned,
+-        pc_off as i64,
+-        sema_off as i64,
+-        consumer,
+-    );
+-    let raw = handle as i64;
+-    if (-4096..0).contains(&raw) || handle.is_null() {
+-        pr_err!(
+-            "bifrost_guest: usdt slot[{}] uprobe_register failed: {}\n",
+-            slot, raw
+-        );
+-        iput(pinned);
+-        return if raw < 0 { raw as c_int } else { -(bindings::EINVAL as i32) };
+-    }
+-    slots_mut()[slot].uprobe_handle = handle;
+-    slots_mut()[slot].uprobe_inode = pinned;
+-    (*bg).kprobe_attached = true;
+-    BIFROST_NUM_KPROBES = slot + 1;
+-    pr_info!(
+-        "bifrost_guest: usdt slot[{}] registered on {}:{}:{} pc=+0x{:x} sema=+0x{:x}\n",
+-        slot,
+-        core::str::from_utf8(basename).unwrap_or("?"),
+-        core::str::from_utf8(sdt_provider).unwrap_or("?"),
+-        core::str::from_utf8(sdt_probe).unwrap_or("?"),
+-        pc_off, sema_off
+-    );
+-    0
+-    }
+-}
+-
+-/// Register a host-resolved uprobe (PROBE_TYPE_UPROBE /
+-/// URETPROBE).  The CLI ferried (path, file_offset) in the BFR7
+-/// trailer.  Path resolution is two-stage:
+-///
+-///   1. Container-aware exe_file lookup via `find_task_by_comm`
+-///      → `get_task_exe_file` → `igrab`.  Works for binaries that
+-///      live only in a container's overlayfs (init's mount ns
+-///      has no visibility there).
+-///
+-///   2. `kern_path` fallback with retry-with-backoff (handles
+-///      the boot-order race where LOAD_PROG arrives at ~50ms
+-///      while virtiofs hasn't finished mounting the rootfs yet).
+-///
+-/// Storage: when (1) succeeds, kpath stays zero and
+-/// slots_mut()[slot].uprobe_path is left as the empty path; cleanup
+-/// branches on dentry.is_null() to skip path_put.  The pinned
+-/// inode (igrab'd from the file's f_inode) handles lifetime
+-/// either way.
+-///
+-/// Symmetric to cleanup_slot_uprobe.
+-unsafe fn attach_slot_uprobe(
+-    slot: usize,
+-    probe_type: u8,
+-    name_str: &str,
+-    uprobe_path_buf: &[u8; 257],
+-    uprobe_file_offset: u64,
+-    bg: *mut BifrostGuest,
+-) -> c_int {
+-    unsafe {
+-    // Defense in depth: caller (slot_family_attach via the
+-    // LOAD_PROG dispatch) already called slots_ensure(slot+1).
+-    // This check protects against a misuse from a future caller
+-    // that forgets the grow step.
+-    if slot >= slots_mut().len() {
+-        pr_err!("bifrost_guest: uprobe slot[{}] out of range (len={})\n", slot, slots_mut().len());
+-        return -(bindings::EINVAL as i32);
+-    }
+-    // Initialize the wrapper's slot field, then expose the consumer
+-    // pointer for the kernel uprobe API.  The kernel only sees the
+-    // consumer; our shared handler recovers `slot` via container-of.
+-    let bp_ptr = slots_mut()[slot].uprobe.as_mut_ptr();
+-    (*bp_ptr).slot = slot as u32;
+-    let consumer: *mut bindings::uprobe_consumer = &mut (*bp_ptr).consumer as *mut _;
+-    if consumer.is_null() {
+-        pr_err!("bifrost_guest: uprobe slot[{}] consumer ptr null\n", slot);
+-        return -(bindings::EINVAL as i32);
+-    }
+-    let mut kpath: bindings::path = bindings::path {
+-        mnt: core::ptr::null_mut(),
+-        dentry: core::ptr::null_mut(),
+-    };
+-    let mut pinned: *mut bindings::inode = core::ptr::null_mut();
+-    let mut resolved_via = "<unset>";
+-
+-    // Stage 1: exe_file via for_each_process.
+-    let basename = path_basename(uprobe_path_buf);
+-    if !basename.is_empty() {
+-        let task = find_task_by_comm(basename);
+-        if !task.is_null() {
+-            let exe = get_task_exe_file(task);
+-            put_task_ref(task);
+-            if !exe.is_null() {
+-                let exe_inode = (*exe).f_inode;
+-                pinned = igrab(exe_inode);
+-                // Drop the file ref — the inode pin (igrab
+-                // refcount) is sufficient to keep the inode
+-                // alive for the lifetime of the uprobe.
+-                fput(exe);
+-                if !pinned.is_null() {
+-                    resolved_via = "exe_file";
+-                }
+-            }
+-        }
+-    }
+-
+-    // Stage 2: kern_path fallback with retry.
+-    let mut rc: c_int = 0;
+-    let mut attempts: u32 = 0;
+-    if pinned.is_null() {
+-        rc = -2; // -ENOENT
+-        while attempts < 300 {
+-            rc = kern_path(
+-                uprobe_path_buf.as_ptr() as *const c_char,
+-                1, // LOOKUP_FOLLOW
+-                &mut kpath,
+-            );
+-            if rc == 0 || rc != -2 {
+-                break;
+-            }
+-            // 100 ms = HZ/10 (HZ=1000 on most modern arm64 builds).
+-            bindings::schedule_timeout_interruptible(100);
+-            if bindings::kthread_should_stop() {
+-                break;
+-            }
+-            attempts += 1;
+-        }
+-        if rc == 0 {
+-            let raw_inode = (*kpath.dentry).d_inode;
+-            pinned = igrab(raw_inode);
+-            if pinned.is_null() {
+-                path_put(&kpath);
+-                kpath.mnt = core::ptr::null_mut();
+-                kpath.dentry = core::ptr::null_mut();
+-            } else {
+-                resolved_via = if attempts > 0 {
+-                    "kern_path (after retries)"
+-                } else {
+-                    "kern_path"
+-                };
+-            }
+-        }
+-    }
+-
+-    if pinned.is_null() {
+-        pr_err!(
+-            "bifrost_guest: uprobe slot[{}] path resolution failed for '{}' (kern_path={} after {} retries; no task with matching comm)\n",
+-            slot,
+-            core::str::from_utf8(
+-                &uprobe_path_buf[..uprobe_path_buf
+-                    .iter()
+-                    .position(|&b| b == 0)
+-                    .unwrap_or(0)]
+-            )
+-            .unwrap_or("?"),
+-            rc,
+-            attempts
+-        );
+-        return if rc != 0 { rc } else { -(bindings::ENOENT as i32) };
+-    }
+-    pr_info!(
+-        "bifrost_guest: uprobe slot[{}] resolved '{}' via {} (attempts={})\n",
+-        slot,
+-        core::str::from_utf8(
+-            &uprobe_path_buf[..uprobe_path_buf
+-                .iter()
+-                .position(|&b| b == 0)
+-                .unwrap_or(0)]
+-        )
+-        .unwrap_or("?"),
+-        resolved_via,
+-        attempts
+-    );
+-    // Zero the consumer struct, then wire either entry or return
+-    // handler based on probe_type.
+-    core::ptr::write_bytes(consumer, 0, 1);
+-    if probe_type == PROBE_TYPE_URETPROBE {
+-        (*consumer).ret_handler = match slot {
+-// shared handler — slot recovered via container-of
+-            _ => Some(bifrost_uretprobe_handler),
+-        };
+-    } else {
+-        (*consumer).handler = match slot {
+-// shared handler — slot recovered via container-of
+-            _ => Some(bifrost_uprobe_handler),
+-        };
+-    }
+-    let handle = uprobe_register(
+-        pinned,
+-        uprobe_file_offset as i64,
+-        0, // ref_ctr_offset — only USDT (attach_slot_usdt) uses non-zero
+-        consumer,
+-    );
+-    let raw = handle as i64;
+-    if (-4096..0).contains(&raw) || handle.is_null() {
+-        pr_err!(
+-            "bifrost_guest: uprobe_register slot[{}] failed: {}\n",
+-            slot, raw
+-        );
+-        iput(pinned);
+-        if !kpath.dentry.is_null() {
+-            path_put(&kpath);
+-        }
+-        return if raw < 0 { raw as c_int } else { -(bindings::EINVAL as i32) };
+-    }
+-    slots_mut()[slot].uprobe_handle = handle;
+-    slots_mut()[slot].uprobe_inode = pinned;
+-    slots_mut()[slot].uprobe_path = kpath;
+-    (*bg).kprobe_attached = true;
+-    BIFROST_NUM_KPROBES = slot + 1;
+-    let kind = if probe_type == PROBE_TYPE_URETPROBE {
+-        "uretprobe"
+-    } else {
+-        "uprobe"
+-    };
+-    pr_info!(
+-        "bifrost_guest: {} slot[{}] registered on '{}' +0x{:x} -> {}\n",
+-        kind,
+-        slot,
+-        core::str::from_utf8(
+-            &uprobe_path_buf[..uprobe_path_buf
+-                .iter()
+-                .position(|&b| b == 0)
+-                .unwrap_or(0)]
+-        )
+-        .unwrap_or("?"),
+-        uprobe_file_offset,
+-        name_str
+-    );
+-    0
+-    }
+-}
+-
+-/// Tear down an FBT (FENTRY/FEXIT) trampoline link allocated in
+-/// the per-slot static storage.  Symmetric to the LOAD_PROG arm
+-/// at line ~600 that calls `bpf_trampoline_get` +
+-/// `bpf_trampoline_link_prog` — we reverse it via
+-/// `bpf_trampoline_unlink_prog` + `bpf_trampoline_put`.  The
+-/// `bpf_link` itself was never exposed via fd, so its refcnt
+-/// stays at the `bpf_link_init` default (1) and we don't
+-/// `bpf_link_put`.
+-unsafe fn cleanup_slot_fbt(s: usize) {
+-    unsafe {
+-    if !slots_mut()[s].fbt_linked {
+-        return;
+-    }
+-    let link_p: *mut bindings::bpf_tracing_link = if (s as usize) < slots_mut().len() {
+-        slots_mut()[s as usize].fbt_link.as_mut_ptr()
+-    } else { core::ptr::null_mut() };
+-    if !link_p.is_null() {
+-        let tr = (*link_p).trampoline;
+-        bindings::bpf_trampoline_unlink_prog(
+-            &mut (*link_p).link as *mut bindings::bpf_tramp_link,
+-            tr,
+-            core::ptr::null_mut(),
+-        );
+-        if !tr.is_null() {
+-            bindings::bpf_trampoline_put(tr);
+-        }
+-    }
+-    slots_mut()[s].fbt_linked = false;
+-    }
+-}
+-
+-/// Tear down a raw-tracepoint registration in the per-slot static
+-/// storage.  Symmetric to the LOAD_PROG arm: unregister the
+-/// `bpf_raw_tp_link` from the tracepoint via
+-/// `bpf_probe_unregister`, then drop the module ref taken at
+-/// register time via `bpf_put_raw_tracepoint`.  The link is
+-/// static storage (never exposed via fd), refcnt stays at 1 from
+-/// `bpf_link_init`.
+-unsafe fn cleanup_slot_tracepoint(s: usize) {
+-    unsafe {
+-    if !slots_mut()[s].rawtp_registered {
+-        return;
+-    }
+-    let link_p: *mut bindings::bpf_raw_tp_link = if (s as usize) < slots_mut().len() {
+-        slots_mut()[s as usize].rawtp_link.as_mut_ptr()
+-    } else { core::ptr::null_mut() };
+-    let btp = slots_mut()[s].rawtp_btp;
+-    if !link_p.is_null() && !btp.is_null() {
+-        let _ = bpf_probe_unregister(btp, link_p);
+-        bpf_put_raw_tracepoint(btp);
+-    }
+-    slots_mut()[s].rawtp_btp = core::ptr::null_mut();
+-    slots_mut()[s].rawtp_registered = false;
+-    }
+-}
+-
+-/// Tear down a uprobe registration (host- or kernel-resolved).
+-/// Returns `true` if there was an active uprobe handle that we
+-/// called `uprobe_unregister_nosync` on — the caller batches a
+-/// single `uprobe_unregister_sync()` after the loop to drain
+-/// outstanding handlers across all slots in one shot.  We also
+-/// drop the inode pin (`iput`) and path ref (`path_put`) taken at
+-/// register time.
+-unsafe fn cleanup_slot_uprobe(s: usize) -> bool {
+-    unsafe {
+-    let mut had_uprobe = false;
+-    let handle = slots_mut()[s].uprobe_handle;
+-    let consumer: *mut bindings::uprobe_consumer = if s < slots_mut().len() {
+-        let bp_ptr = slots_mut()[s].uprobe.as_mut_ptr();
+-        &mut (*bp_ptr).consumer as *mut _
+-    } else {
+-        core::ptr::null_mut()
+-    };
+-    if !handle.is_null() && !consumer.is_null() {
+-        uprobe_unregister_nosync(handle, consumer);
+-        had_uprobe = true;
+-    }
+-    slots_mut()[s].uprobe_handle = core::ptr::null_mut();
+-    let inode = slots_mut()[s].uprobe_inode;
+-    if !inode.is_null() {
+-        iput(inode);
+-        slots_mut()[s].uprobe_inode = core::ptr::null_mut();
+-    }
+-    if !slots_mut()[s].uprobe_path.dentry.is_null() {
+-        path_put(&slots_mut()[s].uprobe_path);
+-        slots_mut()[s].uprobe_path = bindings::path {
+-            mnt: core::ptr::null_mut(),
+-            dentry: core::ptr::null_mut(),
+-        };
+-    }
+-    had_uprobe
+-    }
+-}
+-
+ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
+     unsafe {
+         let bg = (*vdev).priv_ as *mut BifrostGuest;
+-- 
+2.50.1 (Apple Git-155)
+

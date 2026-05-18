@@ -1,0 +1,1406 @@
+From 86d4241aa4b5b98ac5cf15c52227571419c8fd62 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Mon, 11 May 2026 21:25:03 -0700
+Subject: [PATCH] bifrost: split guest driver helpers
+
+---
+ drivers/bifrost/bifrost.rs         | 676 +----------------------------
+ drivers/bifrost/bifrost_helpers.c  |  10 +-
+ drivers/bifrost/kfunc_manifest.rs  | 134 ++++++
+ drivers/bifrost/load_prog_parse.rs | 188 ++++++++
+ drivers/bifrost/slots.rs           | 150 +++++++
+ drivers/bifrost/symtab_snapshot.rs | 101 +++++
+ 6 files changed, 595 insertions(+), 664 deletions(-)
+ create mode 100644 drivers/bifrost/kfunc_manifest.rs
+ create mode 100644 drivers/bifrost/load_prog_parse.rs
+ create mode 100644 drivers/bifrost/slots.rs
+ create mode 100644 drivers/bifrost/symtab_snapshot.rs
+
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index 15510a50c243..cdbffc3fda64 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -19,6 +19,10 @@
+ //   bpf_consts.rs            BPF_MAP_TYPE_* + BPF_LD_IMM64 +
+ //                            BPF_PSEUDO_MAP_FD (kernel BPF API)
+ //   shmem_layout.rs          SHMEM_* region size + sub-region offsets
++//   kfunc_manifest.rs        Rust/C helper ABI manifest validation
++//   load_prog_parse.rs       bounded LOAD_PROG payload parser
++//   slots.rs                 heap-backed probe slot table + leases
++//   symtab_snapshot.rs       SHMEM side-channel symbol table pushes
+ //
+ // Pending (each requires a kernel rebuild + per-attach demo sweep
+ // to land safely; deferred until that build cycle is available):
+@@ -55,13 +59,17 @@
+ // (where the platform default isn't auto-coerced).
+ use kernel::ffi::{c_void, c_int, c_char};
+ use core::mem::MaybeUninit;
+-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
++use core::sync::atomic::{AtomicBool, Ordering};
+ 
+ mod bpf_consts;
++mod kfunc_manifest;
++mod load_prog_parse;
+ mod path_helpers;
+ mod record_writer;
+ mod shmem_layout;
+ mod shmem_publish;
++mod slots;
++mod symtab_snapshot;
+ mod task_helpers;
+ mod types;
+ // wire.rs is a SYMLINK to the canonical bifrost-wire crate at
+@@ -73,13 +81,16 @@
+ // visibility consistent across all consumers.
+ #[allow(unreachable_pub)]
+ mod wire;
+-use bpf_consts::{
+-    BPF_LD_IMM64, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF,
+-    BPF_PSEUDO_MAP_FD,
+-};
++use bpf_consts::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF};
++use load_prog_parse::validate_load_prog_cmd;
+ use path_helpers::path_basename;
+ use record_writer::RecordWriter;
+ use shmem_publish::{populate_shmem_btf, populate_shmem_kallsyms};
++use slots::{
++    bifrost_slots_init, slot_lease_new, slots_ensure, slots_mut, BifrostUprobe,
++    BIFROST_NUM_KPROBES, INITIAL_SLOT_HINT,
++};
++use symtab_snapshot::push_symtab_snapshot_cb;
+ use task_helpers::{find_task_by_comm, put_task_ref};
+ use types::{BifrostCmd, BpfInsn, MapDef};
+ use shmem_layout::{
+@@ -91,7 +102,6 @@
+     AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_KIND_SUM, AGG_SNAPSHOT_PROBE_ID,
+     PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE,
+     PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
+-    SYM_TABLE_PROBE_MAGIC,
+ };
+ 
+ module! {
+@@ -200,238 +210,6 @@ unsafe fn map_bifrost_virtio_shmem(vdev: *mut bindings::virtio_device) -> *mut u
+ /// fixtures that still ship raw eBPF expecting EVENT_OPENAT records).
+ const EVENT_OPENAT: u32 = 1;
+ 
+-/// Multi-program / multi-kprobe support. Each `bifrost:` clause in
+-/// the user's D source produces one entry here: a JIT'd bpf_prog,
+-/// a 'static-lifetime kprobe struct, and a 32-byte target_name
+-/// (NUL-padded, must outlive the registered kprobe). All programs
+-/// share the single ringbuf above; map allocation is deduped by
+-/// fake_fd so subsequent LOAD_PROG entries don't re-allocate.
+-/// Initial slot-table capacity allocated at module init.
+-/// **Phase C completion**: the slot table is now a
+-/// `KVec<KBox<BifrostSlot>>` that grows on demand — there is no
+-/// hard cap.  The driver pre-allocates `INITIAL_SLOT_HINT` slots
+-/// to avoid kmalloc churn for typical workloads (most demos run
+-/// 1-6 programs); slot N requests beyond the current length
+-/// trigger a `KBox::new(BifrostSlot::new(), GFP_KERNEL)` plus a
+-/// `KVec::push(GFP_KERNEL)` per missing slot.
+-///
+-/// 8 keeps the boot allocation small (~80 bytes for the KVec +
+-/// 8 × `sizeof(BifrostSlot)` for the Box bodies) so module load
+-/// is cheap; slot growth is amortized across attach paths that
+-/// were already calling into the kernel allocator for prog
+-/// JIT'ing.
+-const INITIAL_SLOT_HINT: usize = 8;
+-
+-/// Compatibility soft cap referenced by the host CLI's preflight
+-/// check.  The driver does not enforce this — `slots_ensure` will
+-/// grow past it on demand — but the CLI uses it to give users a
+-/// fast actionable error instead of silently letting a 10000-
+-/// program wrapper trigger 9992 GFP_KERNEL allocations on the
+-/// hot path.  Mirrors `wire::MAX_PROBE_SLOTS` (single source of
+-/// truth in `host/bifrost-wire/src/lib.rs`).
+-const MAX_KPROBES: usize = wire::MAX_PROBE_SLOTS;
+-
+-/// Per-slot uprobe consumer wrapper.  Container-of slot recovery:
+-/// the kernel uprobe API holds `*mut uprobe_consumer` after register;
+-/// our shared `bifrost_uprobe_handler` casts that pointer back to
+-/// `*const BifrostUprobe` (consumer is the first field with
+-/// `#[repr(C)]`) to read `slot`.
+-#[repr(C)]
+-struct BifrostUprobe {
+-    consumer: bindings::uprobe_consumer,
+-    slot: u32,
+-}
+-
+-/// Coalesced per-slot state.  Phase C step 2 (notes/architecture-
+-/// diagnosis.md W2): the previous shape was 13 parallel
+-/// `static mut [T; MAX_KPROBES]` arrays.  Adding a per-slot field
+-/// is now one line here + one default in `BifrostSlot::new()`,
+-/// rather than a new top-level static.
+-///
+-/// Pointer stability: `BIFROST_SLOTS` is a single static at fixed
+-/// kernel address; field offsets within `BifrostSlot` are also
+-/// fixed.  Consumer pointers (`&BIFROST_SLOTS[i].uprobe.assume_init_ref().consumer`)
+-/// stay valid for the life of the kernel module, which matches the
+-/// kernel uprobe API's lifetime expectation.
+-#[repr(C)]
+-struct BifrostSlot {
+-    /// Probe family discriminant; sentinel `PROBE_TYPE_NONE` (0xff)
+-    /// means "slot allocated but never registered."
+-    probe_type: u8,
+-    /// 32-byte NUL-padded target name.
+-    target_name: [u8; 32],
+-    /// Monotonic lease ID issued at attach time.  0 = no lease.
+-    lease: u64,
+-    /// JIT'd eBPF program pointer.  Atomic so cleanup can swap-and-
+-    /// free without racing the firing path.
+-    prog: AtomicPtr<bindings::bpf_prog>,
+-    /// Uprobe consumer wrapper (used by uprobe / uretprobe / by-sym /
+-    /// USDT).  `MaybeUninit` because the kernel populates it during
+-    /// `uprobe_register`; we explicitly write_bytes(0) before each
+-    /// register call.
+-    uprobe: core::mem::MaybeUninit<BifrostUprobe>,
+-    /// Uprobe registration handle from `uprobe_register`.  Non-null =
+-    /// registered.
+-    uprobe_handle: *mut bindings::uprobe,
+-    /// igrab'd inode pinning the uprobe target file.
+-    uprobe_inode: *mut bindings::inode,
+-    /// kern_path output (vfsmount + dentry); path_put on cleanup
+-    /// when dentry is non-null.
+-    uprobe_path: bindings::path,
+-    /// FBT (FENTRY/FEXIT) trampoline link.  `MaybeUninit` because
+-    /// `bpf_link_init` populates it; we write_bytes(0) before each
+-    /// init call.
+-    fbt_link: core::mem::MaybeUninit<bindings::bpf_tracing_link>,
+-    /// True when fbt_link is currently linked to a trampoline.
+-    fbt_linked: bool,
+-    /// Raw-tracepoint link.  Same MaybeUninit pattern as fbt_link.
+-    rawtp_link: core::mem::MaybeUninit<bindings::bpf_raw_tp_link>,
+-    /// Cached `bpf_raw_event_map *` for `bpf_put_raw_tracepoint`.
+-    rawtp_btp: *mut bindings::bpf_raw_event_map,
+-    /// True when rawtp_link is currently registered.
+-    rawtp_registered: bool,
+-}
+-
+-impl BifrostSlot {
+-    /// Const-evaluable fresh slot — used to populate the
+-    /// `BIFROST_SLOTS` array at static-init time.  All pointer-
+-    /// shaped fields zero out; MaybeUninit fields stay
+-    /// uninitialized (the kernel API populates them on register).
+-    const fn new() -> Self {
+-        Self {
+-            probe_type: PROBE_TYPE_NONE,
+-            target_name: [0u8; 32],
+-            lease: 0,
+-            prog: AtomicPtr::new(core::ptr::null_mut()),
+-            uprobe: core::mem::MaybeUninit::uninit(),
+-            uprobe_handle: core::ptr::null_mut(),
+-            uprobe_inode: core::ptr::null_mut(),
+-            uprobe_path: bindings::path {
+-                mnt: core::ptr::null_mut(),
+-                dentry: core::ptr::null_mut(),
+-            },
+-            fbt_link: core::mem::MaybeUninit::uninit(),
+-            fbt_linked: false,
+-            rawtp_link: core::mem::MaybeUninit::uninit(),
+-            rawtp_btp: core::ptr::null_mut(),
+-            rawtp_registered: false,
+-        }
+-    }
+-}
+-
+-/// The single per-slot storage.  Replaces the 13 parallel
+-/// `static mut [T; MAX_KPROBES]` shapes (BIFROST_PROGS,
+-/// BIFROST_KPROBE_TARGETS, BIFROST_PROBE_TYPES, BIFROST_UPROBES,
+-/// BIFROST_UPROBE_HANDLE, BIFROST_UPROBE_INODE, BIFROST_UPROBE_PATH,
+-/// BIFROST_FBT_LINKS, BIFROST_TRACING_LINKED, BIFROST_RAWTP_LINKS,
+-/// BIFROST_RAWTP_BTP, BIFROST_RAWTP_REGISTERED, BIFROST_SLOT_LEASE).
+-///
+-/// Heap-allocated via `KVec<KBox<BifrostSlot>>` — the **slot bodies
+-/// live at heap-allocated `KBox` addresses**, while the KVec only
+-/// stores 8-byte `KBox` pointers.  When the KVec reallocates to
+-/// grow past its current capacity, only those Box pointers move;
+-/// the BifrostSlot bodies stay at their original heap addresses.
+-/// This is the load-bearing pointer-stability guarantee for the
+-/// kernel uprobe API: `BifrostUprobe::consumer` pointers handed
+-/// to `uprobe_register` resolve to a fixed heap address for the
+-/// life of the slot regardless of subsequent attach/detach on
+-/// other slots.
+-///
+-/// `None` until module init; `Some(KVec)` thereafter.  The KVec
+-/// starts with `INITIAL_SLOT_HINT` slots pre-allocated and grows
+-/// on demand via `slots_ensure`.  No hard cap.
+-///
+-/// Single-threaded access: bifrost_probe → worker kthread →
+-/// bifrost_remove is the existing concurrency contract; no
+-/// SpinLock yet.  Multi-device support would add one.
+-static mut BIFROST_SLOTS_OPT: Option<KVec<KBox<BifrostSlot>>> = None;
+-
+-/// Initialize the slot table.  Called once from
+-/// `BifrostGuestModule::init`.  Returns Err on alloc failure;
+-/// the module load fails cleanly with -ENOMEM in that case.
+-///
+-/// Pre-allocates `INITIAL_SLOT_HINT` slots so the common case
+-/// (small D scripts with 1–6 programs) hits zero kmalloc on the
+-/// LOAD_PROG hot path.  Larger workloads grow via
+-/// `slots_ensure` when slot N >= current length.
+-fn bifrost_slots_init() -> Result<()> {
+-    // SAFETY: called exactly once during module init before any
+-    // worker thread is started; no concurrent access possible.
+-    unsafe {
+-        if BIFROST_SLOTS_OPT.is_some() {
+-            return Ok(());
+-        }
+-        let mut v: KVec<KBox<BifrostSlot>> =
+-            KVec::with_capacity(INITIAL_SLOT_HINT, GFP_KERNEL)?;
+-        for _ in 0..INITIAL_SLOT_HINT {
+-            let b = KBox::new(BifrostSlot::new(), GFP_KERNEL)?;
+-            v.push(b, GFP_KERNEL)?;
+-        }
+-        BIFROST_SLOTS_OPT = Some(v);
+-    }
+-    Ok(())
+-}
+-
+-/// Ensure the slot table has at least `n` slots, allocating new
+-/// `KBox<BifrostSlot>` entries as needed.  Idempotent (returns
+-/// Ok without touching state if `len >= n` already).
+-///
+-/// Returns Err on alloc failure.  Callers in the LOAD_PROG attach
+-/// path use this to grow the table before slot N is referenced;
+-/// alloc failure surfaces as a per-program SLOT_EXHAUSTED status
+-/// in the response array (Phase B's wire path).
+-///
+-/// Pointer stability across grow: KVec realloc moves the KBox
+-/// **pointers** (8 bytes each), not the heap-allocated
+-/// BifrostSlot **bodies**.  Consumer pointers held by the kernel
+-/// uprobe API resolve to the unchanged Box body address and stay
+-/// valid.
+-unsafe fn slots_ensure(n: usize) -> Result<()> {
+-    unsafe {
+-        let v = BIFROST_SLOTS_OPT.as_mut().unwrap_unchecked();
+-        while v.len() < n {
+-            let b = KBox::new(BifrostSlot::new(), GFP_KERNEL)?;
+-            v.push(b, GFP_KERNEL)?;
+-        }
+-        Ok(())
+-    }
+-}
+-
+-/// Slot-table accessor.  Returns a mutable slice of `KBox`
+-/// pointers; field access via `slots_mut()[i].field` autoderefs
+-/// through `KBox` to the underlying `BifrostSlot` body.
+-///
+-/// SAFETY: caller must ensure `bifrost_slots_init()` has run.
+-/// Module init runs before any other code path that touches a
+-/// slot, so this is true by construction.
+-#[inline]
+-unsafe fn slots_mut() -> &'static mut [KBox<BifrostSlot>] {
+-    unsafe {
+-        BIFROST_SLOTS_OPT
+-            .as_mut()
+-            .unwrap_unchecked()
+-            .as_mut_slice()
+-    }
+-}
+-
+-/// Counter for the next slot to fill on LOAD_PROG. Bounded by
+-/// MAX_KPROBES.  When the heap migration lands, this becomes
+-/// `slots.lock().len()`.
+-static mut BIFROST_NUM_KPROBES: usize = 0;
+-
+-/// Monotonic lease counter.  AtomicU64 so concurrent LOAD_PROG
+-/// workers (in principle) can't collide; in practice a single
+-/// kthread serializes LOAD_PROG today, but Phase C's wire-level
+-/// guarantee shouldn't rely on that.  Starts at 1; 0 is the
+-/// "no lease" sentinel.
+-static BIFROST_NEXT_LEASE: AtomicU64 = AtomicU64::new(1);
+-
+-/// Allocate a fresh slot lease.  Always non-zero.
+-#[inline]
+-fn slot_lease_new() -> u64 {
+-    BIFROST_NEXT_LEASE.fetch_add(1, Ordering::AcqRel)
+-}
+-
+ /// Empty bpf_link_ops for our tracing links. The link is never exposed
+ /// to userspace via fd, so .release / .dealloc / .show_fdinfo etc. are
+ /// never invoked. But the kernel's bpf_link_init does
+@@ -485,95 +263,7 @@ fn slot_lease_new() -> u64 {
+ /// data across devices.
+ static BIFROST_DEVICE_LIVE: AtomicBool = AtomicBool::new(false);
+ 
+-// Phase K — kfunc manifest expected on the C side.  Each entry is
+-// (name, canonical_signature_string).  bifrost_helpers.c carries the
+-// identical list as `BIFROST_KFUNC_MANIFEST`; module init validates
+-// they match by computing the same djb2 hash on both sides.
+-//
+-// Adding a new bifrost_helper_*: append here AND in bifrost_helpers.c.
+-// Order matters — the hash mixes entries in array order.
+-//
+-// Changing a signature: update the sig string in both places.  Module
+-// init refuses to load on mismatch with a named pr_err so silent
+-// Rust↔C ABI drift can't ship.
+-struct KfuncDecl {
+-    name: &'static [u8],
+-    sig: &'static [u8],
+-}
+-
+-const BIFROST_KFUNC_EXPECTED: &[KfuncDecl] = &[
+-    KfuncDecl {
+-        name: b"bifrost_helper_find_task_by_comm",
+-        sig: b"struct task_struct *(const unsigned char *, unsigned int)",
+-    },
+-    KfuncDecl {
+-        name: b"bifrost_helper_put_task_struct",
+-        sig: b"void (struct task_struct *)",
+-    },
+-    KfuncDecl {
+-        name: b"bifrost_helper_resolve_symbol",
+-        sig: b"int (struct file *, const u8 *, u32, u64 *, u64 *)",
+-    },
+-    KfuncDecl {
+-        name: b"bifrost_helper_resolve_usdt",
+-        sig: b"int (struct file *, const u8 *, u32, const u8 *, u32, u64 *, u64 *)",
+-    },
+-    KfuncDecl {
+-        name: b"bifrost_helper_emit_symtab",
+-        sig: b"int (struct file *, u8 *, u32, u32, u32 *)",
+-    },
+-    KfuncDecl {
+-        name: b"bifrost_helper_emit_symtab_for_file",
+-        sig: b"int (struct file *, u8 *, u32, u32, u32 *)",
+-    },
+-    KfuncDecl {
+-        name: b"bifrost_helper_for_each_vma_file",
+-        sig: b"void (struct task_struct *, void (*)(struct file *, void *), void *)",
+-    },
+-];
+-
+-/// Const-fn djb2 — same algorithm bifrost_helpers.c uses.  `h = 5381;
+-/// for each byte b: h = (h * 33) + b`, wrapping mod 2^32.  Const-eval
+-/// means the expected hash is computed at compile time and the runtime
+-/// check is a single u32 compare.
+-const fn bifrost_kfunc_djb2_byte(h: u32, b: u8) -> u32 {
+-    h.wrapping_mul(33).wrapping_add(b as u32)
+-}
+-
+-const fn bifrost_kfunc_djb2_bytes(mut h: u32, bytes: &[u8]) -> u32 {
+-    let mut i = 0;
+-    while i < bytes.len() {
+-        h = bifrost_kfunc_djb2_byte(h, bytes[i]);
+-        i += 1;
+-    }
+-    // Trailing NUL — matches the C side which mixes one extra `* 33`
+-    // after each name and each sig as a field separator.
+-    h.wrapping_mul(33)
+-}
+-
+-const fn bifrost_kfunc_expected_hash() -> u32 {
+-    let mut h: u32 = 5381;
+-    let mut i = 0;
+-    while i < BIFROST_KFUNC_EXPECTED.len() {
+-        h = bifrost_kfunc_djb2_bytes(h, BIFROST_KFUNC_EXPECTED[i].name);
+-        h = bifrost_kfunc_djb2_bytes(h, BIFROST_KFUNC_EXPECTED[i].sig);
+-        i += 1;
+-    }
+-    h
+-}
+-
+-const BIFROST_KFUNC_EXPECTED_HASH: u32 = bifrost_kfunc_expected_hash();
+-const BIFROST_KFUNC_EXPECTED_LEN: u32 = BIFROST_KFUNC_EXPECTED.len() as u32;
+-
+ extern "C" {
+-    /// Phase K — manifest hash exported by bifrost_helpers.c.  Mismatch
+-    /// vs `BIFROST_KFUNC_EXPECTED_HASH` ⇒ Rust extern decls disagree
+-    /// with the live C signatures; refuse module load.
+-    fn bifrost_kfunc_manifest_hash() -> u32;
+-    /// Number of entries in the C-side manifest.  A length mismatch
+-    /// surfaces independently of the hash so the diagnostic names
+-    /// the specific failure mode.
+-    fn bifrost_kfunc_manifest_len() -> u32;
+     /// Clear global SHMEM ringbuf state before the Bifrost device frees
+     /// or unmaps the backing region.
+     fn bifrost_clear_shmem_ringbuf();
+@@ -661,20 +351,6 @@ fn bifrost_helper_resolve_usdt(
+         out_pc_file_offset: *mut u64,
+         out_semaphore_file_offset: *mut u64,
+     ) -> c_int;
+-    /// C helper — pack the ELF function-symbol table of `file` into
+-    /// `buf` for the host's gustack symbolicator.  Wire format is
+-    /// documented inline in drivers/bifrost/bifrost_helpers.c.  The
+-    /// path of the binary (resolved via d_path on file->f_path) is
+-    /// written into the strings region as the first entry; the host
+-    /// keys its symbol cache by that path so it matches the path
+-    /// strings already shipped in the per-task VMA table.
+-    fn bifrost_helper_emit_symtab_for_file(
+-        file: *mut bindings::file,
+-        buf: *mut u8,
+-        buf_size: u32,
+-        sym_idx_start: u32,
+-        sym_idx_next: *mut u32,
+-    ) -> c_int;
+     /// C helper — walk `task->mm`'s file-backed executable VMAs and
+     /// invoke `cb(file, ctx)` for each unique `vm_file`.  Used by the
+     /// uprobe register path to push symtabs for every binary the
+@@ -763,115 +439,6 @@ fn bpf_probe_unregister(
+ /// Iterates each map via `bifrost_map_lookup_sum_u64` for
+ /// PERCPU_ARRAY/HASH (sums per-cpu) or
+ /// `bifrost_map_get_next_key` for HASH-shaped maps.
+-/// Push the ELF function-symbol table of `file` to the host as a
+-/// side-channel record.  Used at uprobe register time (right after
+-/// the symbol-by-name resolution succeeds) so the host's gustack
+-/// renderer can symbolicate frames without ever reading the binary
+-/// off a host-mirrored rootfs.
+-///
+-/// Reserve-write-submit follows the same pattern as
+-/// `push_agg_snapshot` and `bifrost_kfunc_publish_vma_table`: the
+-/// SHMEM ringbuf is the canonical kernel→host transport.
+-/// Trampoline used by `bifrost_helper_for_each_vma_file`'s callback
+-/// hook.  Lets the C helper iterate VMAs (kernel-API-heavy) while
+-/// the symtab push stays on the Rust side (where the
+-/// `bifrost_shmem_reserve_kernel`/`_submit` plumbing already lives).
+-/// `_ctx` is unused — push_symtab_snapshot is global state-free.
+-unsafe extern "C" fn push_symtab_snapshot_cb(file: *mut bindings::file, _ctx: *mut c_void) {
+-    unsafe {
+-        push_symtab_snapshot(file);
+-    }
+-}
+-
+-unsafe fn push_symtab_snapshot(file: *mut bindings::file) {
+-    /// Worst-case body size: 64 KB - a hair to leave room for the
+-    /// SHM record header.  The C helper reserves ~32 KB up-front
+-    /// for the strings region and packs at most ~1351 entries
+-    /// per record before returning a non-zero `sym_idx_next` so
+-    /// we resume on the next iteration.
+-    const MAX_BODY: usize = 64 * 1024 - 256;
+-    /// Hard cap on the loop count — defensive against a
+-    /// pathologically large symtab or a helper bug that returns
+-    /// a non-decreasing sym_idx_next.  redis-server's 3540
+-    /// STT_FUNCs needs ~3 records, libc's ~3000 needs ~3, so 16
+-    /// covers every realistic case with margin.
+-    const MAX_CHUNKS: usize = 16;
+-
+-    if file.is_null() {
+-        return;
+-    }
+-    unsafe {
+-        let mut sym_idx: u32 = 0;
+-        for chunk in 0..MAX_CHUNKS {
+-            let rec =
+-                bindings::bifrost_shmem_reserve_kernel(MAX_BODY as u32) as *mut u8;
+-            if rec.is_null() {
+-                // Producer ring is full or SHMEM not yet wired up
+-                // — drop the rest of the symtab.  The host has
+-                // whatever chunks made it through; degrades into
+-                // offset-only ustack rendering for the missing
+-                // tail.
+-                return;
+-            }
+-
+-            let mut writer = RecordWriter::new(rec, MAX_BODY);
+-            // Correlation header: vmid + probe_id_magic + gns
+-            // + gpid (gpid unused for a global symtab push — set
+-            // to 0).  All chunks for the same binary share the
+-            // same path string in their body, so the host's
+-            // path-keyed `pushed_syms` cache merges them.
+-            writer.write_u32(0);
+-            writer.write_u32(SYM_TABLE_PROBE_MAGIC);
+-            writer.write_u64(bindings::ktime_get_mono_fast_ns());
+-            writer.write_u64(0);
+-            let body_off = writer.off;
+-            let body_buf = rec.add(body_off);
+-            let body_avail = MAX_BODY.saturating_sub(body_off) as u32;
+-
+-            let mut sym_idx_next: u32 = 0;
+-            let written = bifrost_helper_emit_symtab_for_file(
+-                file,
+-                body_buf,
+-                body_avail,
+-                sym_idx,
+-                &mut sym_idx_next as *mut u32,
+-            );
+-            // Submit unconditionally — the host parses the
+-            // header and a written < 0 means n_syms=0 in the
+-            // body so the host's parser bails cleanly without
+-            // adding spurious entries.
+-            bindings::bifrost_shmem_submit_kernel(rec as *mut c_void);
+-            if written < 0 {
+-                pr_err!(
+-                    "bifrost_guest: emit_symtab_for_file chunk[{}] failed: {}\n",
+-                    chunk, written
+-                );
+-                return;
+-            }
+-            // Done when the helper signals it processed the
+-            // whole symtab.
+-            if sym_idx_next == 0 {
+-                return;
+-            }
+-            // Defensive: helper must make progress each call.
+-            // If it returns the same start index, abort to
+-            // avoid a spin loop.
+-            if sym_idx_next <= sym_idx {
+-                pr_err!(
+-                    "bifrost_guest: emit_symtab_for_file chunk[{}] no progress (idx={} -> {})\n",
+-                    chunk, sym_idx, sym_idx_next
+-                );
+-                return;
+-            }
+-            sym_idx = sym_idx_next;
+-        }
+-        pr_err!(
+-            "bifrost_guest: emit_symtab_for_file hit MAX_CHUNKS ({}) — symtab tail dropped\n",
+-            MAX_CHUNKS
+-        );
+-    }
+-}
+-
+ unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+     let _ = bg; // bg held for symmetry; the SHMEM region is module-static.
+     unsafe {
+@@ -1255,182 +822,6 @@ unsafe fn free_slot_prog(slot: usize) {
+     }
+ }
+ 
+-unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32) -> c_int {
+-    unsafe {
+-        const CMD_HDR: usize = core::mem::size_of::<BifrostCmd>();
+-        const FIXED: usize = 4 + 32 + 4;
+-        const MAP_DEF_SIZE: usize = core::mem::size_of::<MapDef>();
+-        const INSN_SIZE: usize = core::mem::size_of::<BpfInsn>();
+-
+-        if cmd.is_null() || (cmd_len as usize) < CMD_HDR {
+-            return -(bindings::EINVAL as i32);
+-        }
+-        let declared = (*cmd).len as usize;
+-        let avail = (cmd_len as usize).saturating_sub(CMD_HDR);
+-        if declared > avail || declared < FIXED {
+-            pr_err!(
+-                "bifrost_guest: LOAD_PROG invalid length declared={} avail={}\n",
+-                declared, avail
+-            );
+-            return -(bindings::EINVAL as i32);
+-        }
+-
+-        let base = (cmd as *const u8).add(CMD_HDR);
+-        let mut off = 0usize;
+-        let limit = declared;
+-
+-        let need = |off: usize, n: usize, limit: usize| -> bool {
+-            off.checked_add(n).map_or(false, |end| end <= limit)
+-        };
+-        if !need(off, 4, limit) {
+-            return -(bindings::EINVAL as i32);
+-        }
+-        let num_maps = *(base.add(off) as *const u32) as usize;
+-        off += 4 + 32;
+-        if !need(off, 4, limit) {
+-            return -(bindings::EINVAL as i32);
+-        }
+-        let flags = *(base.add(off) as *const u32);
+-        off += 4;
+-        let probe_type = (flags & 0xff) as u8;
+-
+-        match probe_type {
+-            PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => {
+-                if !need(off, 4, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                let path_len = *(base.add(off) as *const u32) as usize;
+-                off += 4;
+-                if path_len > 256 || !need(off, path_len, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                off += path_len;
+-                if !need(off, 8, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                off += 8;
+-            }
+-            PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => {
+-                if !need(off, 4, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                let bn_len = *(base.add(off) as *const u32) as usize;
+-                off += 4;
+-                if bn_len == 0 || bn_len > 64 || !need(off, bn_len, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                off += bn_len;
+-                if !need(off, 4, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                let sym_len = *(base.add(off) as *const u32) as usize;
+-                off += 4;
+-                if sym_len == 0 || sym_len > 256 || !need(off, sym_len, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                off += sym_len;
+-            }
+-            PROBE_TYPE_USDT => {
+-                if !need(off, 4, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                let bn_len = *(base.add(off) as *const u32) as usize;
+-                off += 4;
+-                if bn_len == 0 || bn_len > 64 || !need(off, bn_len, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                off += bn_len;
+-                if !need(off, 4, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                let prov_len = *(base.add(off) as *const u32) as usize;
+-                off += 4;
+-                if prov_len == 0 || prov_len > 64 || !need(off, prov_len, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                off += prov_len;
+-                if !need(off, 4, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                let probe_len = *(base.add(off) as *const u32) as usize;
+-                off += 4;
+-                if probe_len == 0 || probe_len > 256 || !need(off, probe_len, limit) {
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                off += probe_len;
+-            }
+-            _ => {}
+-        }
+-
+-        if num_maps > 8 {
+-            pr_err!("bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap 8\n", num_maps);
+-            return -(bindings::EINVAL as i32);
+-        }
+-        let map_bytes = match num_maps.checked_mul(MAP_DEF_SIZE) {
+-            Some(v) => v,
+-            None => return -(bindings::EINVAL as i32),
+-        };
+-        if !need(off, map_bytes, limit) {
+-            return -(bindings::EINVAL as i32);
+-        }
+-        off += map_bytes;
+-
+-        if !need(off, 4, limit) {
+-            return -(bindings::EINVAL as i32);
+-        }
+-        let num_insns = *(base.add(off) as *const u32) as usize;
+-        off += 4;
+-        let insn_bytes = match num_insns.checked_mul(INSN_SIZE) {
+-            Some(v) => v,
+-            None => return -(bindings::EINVAL as i32),
+-        };
+-        if !need(off, insn_bytes, limit) {
+-            return -(bindings::EINVAL as i32);
+-        }
+-
+-        let insns = base.add(off) as *const BpfInsn;
+-        let mut idx = 0usize;
+-        while idx < num_insns {
+-            let insn = &*insns.add(idx);
+-            if insn.code == BPF_LD_IMM64 && insn.src_reg() == BPF_PSEUDO_MAP_FD {
+-                if idx + 1 >= num_insns {
+-                    pr_err!("bifrost_guest: LOAD_PROG ldimm64 at final insn {}\n", idx);
+-                    return -(bindings::EINVAL as i32);
+-                }
+-                idx += 2;
+-            } else {
+-                idx += 1;
+-            }
+-        }
+-        off += insn_bytes;
+-
+-        if !need(off, 4, limit) {
+-            return -(bindings::EINVAL as i32);
+-        }
+-        let num_relocs = *(base.add(off) as *const u32) as usize;
+-        off += 4;
+-        for _ in 0..num_relocs {
+-            if !need(off, 5, limit) {
+-                return -(bindings::EINVAL as i32);
+-            }
+-            let insn_idx = *(base.add(off) as *const u32) as usize;
+-            off += 4;
+-            let name_len = *base.add(off) as usize;
+-            off += 1;
+-            if name_len == 0 || name_len >= 256 || !need(off, name_len, limit) {
+-                return -(bindings::EINVAL as i32);
+-            }
+-            if insn_idx >= num_insns {
+-                return -(bindings::EINVAL as i32);
+-            }
+-            off += name_len;
+-        }
+-        0
+-    }
+-}
+-
+-
+-
+ /// One-shot SHMEM_INIT message to the host. For the generic virtio
+ /// SHM path this is a 24-byte readiness notification (`n_pages=0`);
+ /// the host already owns the region and maps it through the VMM's
+@@ -3814,40 +3205,7 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
+ impl kernel::Module for BifrostGuestModule {
+     fn init(_module: &'static kernel::ThisModule) -> Result<Self> {
+         pr_info!("bifrost_guest: Rust module initialized\n");
+-        // Phase K — kfunc manifest validation.  Refuses to load if
+-        // bifrost_helpers.c's exported manifest disagrees with the
+-        // Rust extern decls' expected manifest.  Two checks: array
+-        // length first (clearer diagnostic on add/remove drift),
+-        // then the djb2 hash (catches signature-string drift).  A
+-        // clean tree never trips this — scripts/check-kfunc-manifest.sh
+-        // gates merges on the same comparison at build time — so
+-        // hitting the runtime check is a hard signal that the C and
+-        // Rust sides got out of sync via a path that bypassed the
+-        // lint (e.g., a libkrunfw patch landed without the matching
+-        // Rust update).
+-        let c_len = unsafe { bifrost_kfunc_manifest_len() };
+-        if c_len != BIFROST_KFUNC_EXPECTED_LEN {
+-            pr_err!(
+-                "bifrost_guest: kfunc manifest length mismatch (C={}, Rust={}); refusing module load.  bifrost_helpers.c and bifrost.rs disagree on the kfunc surface — re-vendor wire.rs / re-run scripts/check-kfunc-manifest.sh.\n",
+-                c_len,
+-                BIFROST_KFUNC_EXPECTED_LEN
+-            );
+-            return Err(Error::from_errno(-(bindings::EINVAL as i32)));
+-        }
+-        let c_hash = unsafe { bifrost_kfunc_manifest_hash() };
+-        if c_hash != BIFROST_KFUNC_EXPECTED_HASH {
+-            pr_err!(
+-                "bifrost_guest: kfunc manifest hash mismatch (C=0x{:08x}, Rust=0x{:08x}); refusing module load.  A bifrost_helper_* signature in bifrost_helpers.c disagrees with the matching extern decl in bifrost.rs.  Likely cause: signature changed on one side without the other.  Run scripts/check-kfunc-manifest.sh to see which entry drifted.\n",
+-                c_hash,
+-                BIFROST_KFUNC_EXPECTED_HASH
+-            );
+-            return Err(Error::from_errno(-(bindings::EINVAL as i32)));
+-        }
+-        pr_info!(
+-            "bifrost_guest: kfunc manifest OK ({} entries, hash=0x{:08x})\n",
+-            c_len,
+-            c_hash
+-        );
++        kfunc_manifest::validate()?;
+         // Phase C heap migration: allocate the slot table before
+         // any virtio probe path can touch it.  ~80 KB kmalloc;
+         // OOM here aborts module load with an actionable -ENOMEM
+diff --git a/drivers/bifrost/bifrost_helpers.c b/drivers/bifrost/bifrost_helpers.c
+index 1aad4cbdbb64..532833bd0c6b 100644
+--- a/drivers/bifrost/bifrost_helpers.c
++++ b/drivers/bifrost/bifrost_helpers.c
+@@ -1140,9 +1140,9 @@ EXPORT_SYMBOL_GPL(bifrost_helper_for_each_vma_file);
+  * UB at runtime.  The manifest makes the contract explicit:
+  *
+  *   1. This file lists every kfunc + its canonical signature string.
+- *   2. drivers/bifrost/bifrost.rs lists the same names + the same
+- *      signature strings (as bytes) in the BIFROST_KFUNC_EXPECTED
+- *      array.
++	 *   2. drivers/bifrost/kfunc_manifest.rs lists the same names +
++	 *      the same signature strings (as bytes) in the
++	 *      BIFROST_KFUNC_EXPECTED array.
+  *   3. bifrost_kfunc_manifest_hash() returns a djb2 hash of the
+  *      concatenated (name, sig) pairs.  At module init the Rust
+  *      side computes the same hash from BIFROST_KFUNC_EXPECTED;
+@@ -1151,8 +1151,8 @@ EXPORT_SYMBOL_GPL(bifrost_helper_for_each_vma_file);
+  *      build time so the runtime check never fires in a clean tree.
+  *
+  * Adding a new kfunc: append to BIFROST_KFUNC_MANIFEST here AND to
+- * BIFROST_KFUNC_EXPECTED in bifrost.rs.  Order matters — both
+- * sides hash in array order.
++	 * BIFROST_KFUNC_EXPECTED in kfunc_manifest.rs.  Order matters —
++	 * both sides hash in array order.
+  *
+  * Changing a signature: update the sig string in both places.  The
+  * djb2 will change; module init will refuse to load until both
+diff --git a/drivers/bifrost/kfunc_manifest.rs b/drivers/bifrost/kfunc_manifest.rs
+new file mode 100644
+index 000000000000..a0385ce711c9
+--- /dev/null
++++ b/drivers/bifrost/kfunc_manifest.rs
+@@ -0,0 +1,134 @@
++// SPDX-License-Identifier: GPL-2.0
++// Runtime validation for the Rust/C Bifrost kfunc helper manifest.
++
++use kernel::bindings;
++use kernel::prelude::*;
++
++// Phase K — kfunc manifest expected on the C side.  Each entry is
++// (name, canonical_signature_string).  bifrost_helpers.c carries the
++// identical list as `BIFROST_KFUNC_MANIFEST`; module init validates
++// they match by computing the same djb2 hash on both sides.
++//
++// Adding a new bifrost_helper_*: append here AND in bifrost_helpers.c.
++// Order matters — the hash mixes entries in array order.
++//
++// Changing a signature: update the sig string in both places.  Module
++// init refuses to load on mismatch with a named pr_err so silent
++// Rust↔C ABI drift can't ship.
++struct KfuncDecl {
++    name: &'static [u8],
++    sig: &'static [u8],
++}
++
++const BIFROST_KFUNC_EXPECTED: &[KfuncDecl] = &[
++    KfuncDecl {
++        name: b"bifrost_helper_find_task_by_comm",
++        sig: b"struct task_struct *(const unsigned char *, unsigned int)",
++    },
++    KfuncDecl {
++        name: b"bifrost_helper_put_task_struct",
++        sig: b"void (struct task_struct *)",
++    },
++    KfuncDecl {
++        name: b"bifrost_helper_resolve_symbol",
++        sig: b"int (struct file *, const u8 *, u32, u64 *, u64 *)",
++    },
++    KfuncDecl {
++        name: b"bifrost_helper_resolve_usdt",
++        sig: b"int (struct file *, const u8 *, u32, const u8 *, u32, u64 *, u64 *)",
++    },
++    KfuncDecl {
++        name: b"bifrost_helper_emit_symtab",
++        sig: b"int (struct file *, u8 *, u32, u32, u32 *)",
++    },
++    KfuncDecl {
++        name: b"bifrost_helper_emit_symtab_for_file",
++        sig: b"int (struct file *, u8 *, u32, u32, u32 *)",
++    },
++    KfuncDecl {
++        name: b"bifrost_helper_for_each_vma_file",
++        sig: b"void (struct task_struct *, void (*)(struct file *, void *), void *)",
++    },
++];
++
++const BIFROST_KFUNC_EXPECTED_HASH: u32 = bifrost_kfunc_expected_hash();
++const BIFROST_KFUNC_EXPECTED_LEN: u32 = BIFROST_KFUNC_EXPECTED.len() as u32;
++
++extern "C" {
++    /// Phase K — manifest hash exported by bifrost_helpers.c.  Mismatch
++    /// vs `BIFROST_KFUNC_EXPECTED_HASH` ⇒ Rust extern decls disagree
++    /// with the live C signatures; refuse module load.
++    fn bifrost_kfunc_manifest_hash() -> u32;
++    /// Number of entries in the C-side manifest.  A length mismatch
++    /// surfaces independently of the hash so the diagnostic names
++    /// the specific failure mode.
++    fn bifrost_kfunc_manifest_len() -> u32;
++}
++
++pub(crate) fn validate() -> Result<()> {
++    // Phase K — kfunc manifest validation.  Refuses to load if
++    // bifrost_helpers.c's exported manifest disagrees with the
++    // Rust extern decls' expected manifest.  Two checks: array
++    // length first (clearer diagnostic on add/remove drift),
++    // then the djb2 hash (catches signature-string drift).  A
++    // clean tree never trips this — scripts/check-kfunc-manifest.sh
++    // gates merges on the same comparison at build time — so
++    // hitting the runtime check is a hard signal that the C and
++    // Rust sides got out of sync via a path that bypassed the
++    // lint (e.g., a libkrunfw patch landed without the matching
++    // Rust update).
++    let c_len = unsafe { bifrost_kfunc_manifest_len() };
++    if c_len != BIFROST_KFUNC_EXPECTED_LEN {
++        pr_err!(
++            "bifrost_guest: kfunc manifest length mismatch (C={}, Rust={}); refusing module load.  bifrost_helpers.c and bifrost.rs disagree on the kfunc surface — re-vendor wire.rs / re-run scripts/check-kfunc-manifest.sh.\n",
++            c_len,
++            BIFROST_KFUNC_EXPECTED_LEN
++        );
++        return Err(Error::from_errno(-(bindings::EINVAL as i32)));
++    }
++    let c_hash = unsafe { bifrost_kfunc_manifest_hash() };
++    if c_hash != BIFROST_KFUNC_EXPECTED_HASH {
++        pr_err!(
++            "bifrost_guest: kfunc manifest hash mismatch (C=0x{:08x}, Rust=0x{:08x}); refusing module load.  A bifrost_helper_* signature in bifrost_helpers.c disagrees with the matching extern decl in bifrost.rs.  Likely cause: signature changed on one side without the other.  Run scripts/check-kfunc-manifest.sh to see which entry drifted.\n",
++            c_hash,
++            BIFROST_KFUNC_EXPECTED_HASH
++        );
++        return Err(Error::from_errno(-(bindings::EINVAL as i32)));
++    }
++    pr_info!(
++        "bifrost_guest: kfunc manifest OK ({} entries, hash=0x{:08x})\n",
++        c_len,
++        c_hash
++    );
++    Ok(())
++}
++
++/// Const-fn djb2 — same algorithm bifrost_helpers.c uses.  `h = 5381;
++/// for each byte b: h = (h * 33) + b`, wrapping mod 2^32.  Const-eval
++/// means the expected hash is computed at compile time and the runtime
++/// check is a single u32 compare.
++const fn bifrost_kfunc_djb2_byte(h: u32, b: u8) -> u32 {
++    h.wrapping_mul(33).wrapping_add(b as u32)
++}
++
++const fn bifrost_kfunc_djb2_bytes(mut h: u32, bytes: &[u8]) -> u32 {
++    let mut i = 0;
++    while i < bytes.len() {
++        h = bifrost_kfunc_djb2_byte(h, bytes[i]);
++        i += 1;
++    }
++    // Trailing NUL — matches the C side which mixes one extra `* 33`
++    // after each name and each sig as a field separator.
++    h.wrapping_mul(33)
++}
++
++const fn bifrost_kfunc_expected_hash() -> u32 {
++    let mut h: u32 = 5381;
++    let mut i = 0;
++    while i < BIFROST_KFUNC_EXPECTED.len() {
++        h = bifrost_kfunc_djb2_bytes(h, BIFROST_KFUNC_EXPECTED[i].name);
++        h = bifrost_kfunc_djb2_bytes(h, BIFROST_KFUNC_EXPECTED[i].sig);
++        i += 1;
++    }
++    h
++}
+diff --git a/drivers/bifrost/load_prog_parse.rs b/drivers/bifrost/load_prog_parse.rs
+new file mode 100644
+index 000000000000..547f12800853
+--- /dev/null
++++ b/drivers/bifrost/load_prog_parse.rs
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: GPL-2.0
++// Bounded parser for direct LOAD_PROG command payloads.
++
++use kernel::bindings;
++use kernel::ffi::c_int;
++use kernel::prelude::*;
++
++use crate::bpf_consts::{BPF_LD_IMM64, BPF_PSEUDO_MAP_FD};
++use crate::types::{BifrostCmd, BpfInsn, MapDef};
++use crate::wire::{
++    PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE,
++    PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
++};
++
++pub(crate) unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32) -> c_int {
++    unsafe {
++        const CMD_HDR: usize = core::mem::size_of::<BifrostCmd>();
++        const FIXED: usize = 4 + 32 + 4;
++        const MAP_DEF_SIZE: usize = core::mem::size_of::<MapDef>();
++        const INSN_SIZE: usize = core::mem::size_of::<BpfInsn>();
++
++        if cmd.is_null() || (cmd_len as usize) < CMD_HDR {
++            return -(bindings::EINVAL as i32);
++        }
++        let declared = (*cmd).len as usize;
++        let avail = (cmd_len as usize).saturating_sub(CMD_HDR);
++        if declared > avail || declared < FIXED {
++            pr_err!(
++                "bifrost_guest: LOAD_PROG invalid length declared={} avail={}\n",
++                declared,
++                avail
++            );
++            return -(bindings::EINVAL as i32);
++        }
++
++        let base = (cmd as *const u8).add(CMD_HDR);
++        let mut off = 0usize;
++        let limit = declared;
++
++        let need = |off: usize, n: usize, limit: usize| -> bool {
++            off.checked_add(n).map_or(false, |end| end <= limit)
++        };
++        if !need(off, 4, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        let num_maps = *(base.add(off) as *const u32) as usize;
++        off += 4 + 32;
++        if !need(off, 4, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        let flags = *(base.add(off) as *const u32);
++        off += 4;
++        let probe_type = (flags & 0xff) as u8;
++
++        match probe_type {
++            PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => {
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let path_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if path_len > 256 || !need(off, path_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += path_len;
++                if !need(off, 8, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += 8;
++            }
++            PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => {
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let bn_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if bn_len == 0 || bn_len > 64 || !need(off, bn_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += bn_len;
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let sym_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if sym_len == 0 || sym_len > 256 || !need(off, sym_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += sym_len;
++            }
++            PROBE_TYPE_USDT => {
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let bn_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if bn_len == 0 || bn_len > 64 || !need(off, bn_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += bn_len;
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let prov_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if prov_len == 0 || prov_len > 64 || !need(off, prov_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += prov_len;
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let probe_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if probe_len == 0 || probe_len > 256 || !need(off, probe_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += probe_len;
++            }
++            _ => {}
++        }
++
++        if num_maps > 8 {
++            pr_err!("bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap 8\n", num_maps);
++            return -(bindings::EINVAL as i32);
++        }
++        let map_bytes = match num_maps.checked_mul(MAP_DEF_SIZE) {
++            Some(v) => v,
++            None => return -(bindings::EINVAL as i32),
++        };
++        if !need(off, map_bytes, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        off += map_bytes;
++
++        if !need(off, 4, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        let num_insns = *(base.add(off) as *const u32) as usize;
++        off += 4;
++        let insn_bytes = match num_insns.checked_mul(INSN_SIZE) {
++            Some(v) => v,
++            None => return -(bindings::EINVAL as i32),
++        };
++        if !need(off, insn_bytes, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++
++        let insns = base.add(off) as *const BpfInsn;
++        let mut idx = 0usize;
++        while idx < num_insns {
++            let insn = &*insns.add(idx);
++            if insn.code == BPF_LD_IMM64 && insn.src_reg() == BPF_PSEUDO_MAP_FD {
++                if idx + 1 >= num_insns {
++                    pr_err!("bifrost_guest: LOAD_PROG ldimm64 at final insn {}\n", idx);
++                    return -(bindings::EINVAL as i32);
++                }
++                idx += 2;
++            } else {
++                idx += 1;
++            }
++        }
++        off += insn_bytes;
++
++        if !need(off, 4, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        let num_relocs = *(base.add(off) as *const u32) as usize;
++        off += 4;
++        for _ in 0..num_relocs {
++            if !need(off, 5, limit) {
++                return -(bindings::EINVAL as i32);
++            }
++            let insn_idx = *(base.add(off) as *const u32) as usize;
++            off += 4;
++            let name_len = *base.add(off) as usize;
++            off += 1;
++            if name_len == 0 || name_len >= 256 || !need(off, name_len, limit) {
++                return -(bindings::EINVAL as i32);
++            }
++            if insn_idx >= num_insns {
++                return -(bindings::EINVAL as i32);
++            }
++            off += name_len;
++        }
++        0
++    }
++}
+diff --git a/drivers/bifrost/slots.rs b/drivers/bifrost/slots.rs
+new file mode 100644
+index 000000000000..ee78cbfba61d
+--- /dev/null
++++ b/drivers/bifrost/slots.rs
+@@ -0,0 +1,150 @@
++// SPDX-License-Identifier: GPL-2.0
++// Heap-backed probe slot table and lease allocation.
++
++use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
++
++use kernel::bindings;
++use kernel::prelude::*;
++
++use crate::wire::{PROBE_TYPE_NONE, MAX_PROBE_SLOTS};
++
++/// Initial slot-table capacity allocated at module init.
++///
++/// **Phase C completion**: the slot table is now a
++/// `KVec<KBox<BifrostSlot>>` that grows on demand; there is no hard
++/// cap.  The driver pre-allocates `INITIAL_SLOT_HINT` slots to avoid
++/// kmalloc churn for typical workloads.
++pub(crate) const INITIAL_SLOT_HINT: usize = 8;
++
++/// Compatibility soft cap referenced by the host CLI's preflight check.
++/// The driver does not enforce this; `slots_ensure` grows past it on
++/// demand.
++pub(crate) const MAX_KPROBES: usize = MAX_PROBE_SLOTS;
++
++/// Per-slot uprobe consumer wrapper.  Container-of slot recovery:
++/// the kernel uprobe API holds `*mut uprobe_consumer` after register;
++/// the shared uprobe handlers cast that pointer back to
++/// `*const BifrostUprobe` because `consumer` is first.
++#[repr(C)]
++pub(crate) struct BifrostUprobe {
++    pub(crate) consumer: bindings::uprobe_consumer,
++    pub(crate) slot: u32,
++}
++
++/// Coalesced per-slot state.  Replaces the older parallel static arrays
++/// for program pointers, target names, attach handles, and cleanup state.
++#[repr(C)]
++pub(crate) struct BifrostSlot {
++    /// Probe family discriminant; sentinel `PROBE_TYPE_NONE` means
++    /// "slot allocated but never registered."
++    pub(crate) probe_type: u8,
++    /// 32-byte NUL-padded target name.
++    pub(crate) target_name: [u8; 32],
++    /// Monotonic lease ID issued at attach time. 0 = no lease.
++    pub(crate) lease: u64,
++    /// JIT'd eBPF program pointer.
++    pub(crate) prog: AtomicPtr<bindings::bpf_prog>,
++    /// Uprobe consumer wrapper.
++    pub(crate) uprobe: core::mem::MaybeUninit<BifrostUprobe>,
++    /// Uprobe registration handle from `uprobe_register`.
++    pub(crate) uprobe_handle: *mut bindings::uprobe,
++    /// igrab'd inode pinning the uprobe target file.
++    pub(crate) uprobe_inode: *mut bindings::inode,
++    /// kern_path output.
++    pub(crate) uprobe_path: bindings::path,
++    /// FBT trampoline link.
++    pub(crate) fbt_link: core::mem::MaybeUninit<bindings::bpf_tracing_link>,
++    /// True when fbt_link is currently linked to a trampoline.
++    pub(crate) fbt_linked: bool,
++    /// Raw-tracepoint link.
++    pub(crate) rawtp_link: core::mem::MaybeUninit<bindings::bpf_raw_tp_link>,
++    /// Cached `bpf_raw_event_map *` for `bpf_put_raw_tracepoint`.
++    pub(crate) rawtp_btp: *mut bindings::bpf_raw_event_map,
++    /// True when rawtp_link is currently registered.
++    pub(crate) rawtp_registered: bool,
++}
++
++impl BifrostSlot {
++    const fn new() -> Self {
++        Self {
++            probe_type: PROBE_TYPE_NONE,
++            target_name: [0u8; 32],
++            lease: 0,
++            prog: AtomicPtr::new(core::ptr::null_mut()),
++            uprobe: core::mem::MaybeUninit::uninit(),
++            uprobe_handle: core::ptr::null_mut(),
++            uprobe_inode: core::ptr::null_mut(),
++            uprobe_path: bindings::path {
++                mnt: core::ptr::null_mut(),
++                dentry: core::ptr::null_mut(),
++            },
++            fbt_link: core::mem::MaybeUninit::uninit(),
++            fbt_linked: false,
++            rawtp_link: core::mem::MaybeUninit::uninit(),
++            rawtp_btp: core::ptr::null_mut(),
++            rawtp_registered: false,
++        }
++    }
++}
++
++/// The single per-slot storage.  Heap-allocated via
++/// `KVec<KBox<BifrostSlot>>`: KVec reallocations move only Box pointers,
++/// not the slot bodies whose addresses are handed to kernel uprobe APIs.
++static mut BIFROST_SLOTS_OPT: Option<KVec<KBox<BifrostSlot>>> = None;
++
++/// Counter for the next slot to fill on LOAD_PROG.
++pub(crate) static mut BIFROST_NUM_KPROBES: usize = 0;
++
++static BIFROST_NEXT_LEASE: AtomicU64 = AtomicU64::new(1);
++
++pub(crate) fn bifrost_slots_init() -> Result<()> {
++    // SAFETY: called exactly once during module init before any worker
++    // thread is started; no concurrent access possible.
++    unsafe {
++        if BIFROST_SLOTS_OPT.is_some() {
++            return Ok(());
++        }
++        let mut v: KVec<KBox<BifrostSlot>> =
++            KVec::with_capacity(INITIAL_SLOT_HINT, GFP_KERNEL)?;
++        for _ in 0..INITIAL_SLOT_HINT {
++            let b = KBox::new(BifrostSlot::new(), GFP_KERNEL)?;
++            v.push(b, GFP_KERNEL)?;
++        }
++        BIFROST_SLOTS_OPT = Some(v);
++    }
++    Ok(())
++}
++
++/// Ensure the slot table has at least `n` slots, allocating new
++/// `KBox<BifrostSlot>` entries as needed.
++pub(crate) unsafe fn slots_ensure(n: usize) -> Result<()> {
++    unsafe {
++        let v = BIFROST_SLOTS_OPT.as_mut().unwrap_unchecked();
++        while v.len() < n {
++            let b = KBox::new(BifrostSlot::new(), GFP_KERNEL)?;
++            v.push(b, GFP_KERNEL)?;
++        }
++        Ok(())
++    }
++}
++
++/// Slot-table accessor.  Returns a mutable slice of `KBox` pointers;
++/// field access via `slots_mut()[i].field` autoderefs through `KBox`
++/// to the underlying `BifrostSlot` body.
++///
++/// SAFETY: caller must ensure `bifrost_slots_init()` has run.
++#[inline]
++pub(crate) unsafe fn slots_mut() -> &'static mut [KBox<BifrostSlot>] {
++    unsafe {
++        BIFROST_SLOTS_OPT
++            .as_mut()
++            .unwrap_unchecked()
++            .as_mut_slice()
++    }
++}
++
++/// Allocate a fresh non-zero slot lease.
++#[inline]
++pub(crate) fn slot_lease_new() -> u64 {
++    BIFROST_NEXT_LEASE.fetch_add(1, Ordering::AcqRel)
++}
+diff --git a/drivers/bifrost/symtab_snapshot.rs b/drivers/bifrost/symtab_snapshot.rs
+new file mode 100644
+index 000000000000..f3bde3675297
+--- /dev/null
++++ b/drivers/bifrost/symtab_snapshot.rs
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: GPL-2.0
++// SHMEM side-channel snapshots for user binary symbol tables.
++
++use kernel::bindings;
++use kernel::ffi::{c_int, c_void};
++use kernel::prelude::*;
++
++use crate::record_writer::RecordWriter;
++use crate::wire::SYM_TABLE_PROBE_MAGIC;
++
++extern "C" {
++    /// C helper: pack the ELF function-symbol table of `file` into
++    /// `buf` for the host's gustack symbolicator.
++    fn bifrost_helper_emit_symtab_for_file(
++        file: *mut bindings::file,
++        buf: *mut u8,
++        buf_size: u32,
++        sym_idx_start: u32,
++        sym_idx_next: *mut u32,
++    ) -> c_int;
++}
++
++/// Trampoline used by `bifrost_helper_for_each_vma_file`'s callback hook.
++/// Lets the C helper iterate VMAs while the symtab push stays on the Rust
++/// side where SHMEM reserve/submit plumbing already lives.
++pub(crate) unsafe extern "C" fn push_symtab_snapshot_cb(
++    file: *mut bindings::file,
++    _ctx: *mut c_void,
++) {
++    unsafe {
++        push_symtab_snapshot(file);
++    }
++}
++
++/// Push the ELF function-symbol table of `file` to the host as a
++/// side-channel record.  Used at uprobe register time so gustack output
++/// can symbolicate frames without reading the binary from a host-mirrored
++/// rootfs.
++unsafe fn push_symtab_snapshot(file: *mut bindings::file) {
++    /// Worst-case body size: 64 KB minus room for the SHM record header.
++    const MAX_BODY: usize = 64 * 1024 - 256;
++    /// Defensive loop cap for very large symtabs or helper bugs.
++    const MAX_CHUNKS: usize = 16;
++
++    if file.is_null() {
++        return;
++    }
++    unsafe {
++        let mut sym_idx: u32 = 0;
++        for chunk in 0..MAX_CHUNKS {
++            let rec = bindings::bifrost_shmem_reserve_kernel(MAX_BODY as u32) as *mut u8;
++            if rec.is_null() {
++                return;
++            }
++
++            let mut writer = RecordWriter::new(rec, MAX_BODY);
++            writer.write_u32(0);
++            writer.write_u32(SYM_TABLE_PROBE_MAGIC);
++            writer.write_u64(bindings::ktime_get_mono_fast_ns());
++            writer.write_u64(0);
++            let body_off = writer.off;
++            let body_buf = rec.add(body_off);
++            let body_avail = MAX_BODY.saturating_sub(body_off) as u32;
++
++            let mut sym_idx_next: u32 = 0;
++            let written = bifrost_helper_emit_symtab_for_file(
++                file,
++                body_buf,
++                body_avail,
++                sym_idx,
++                &mut sym_idx_next as *mut u32,
++            );
++            bindings::bifrost_shmem_submit_kernel(rec as *mut c_void);
++            if written < 0 {
++                pr_err!(
++                    "bifrost_guest: emit_symtab_for_file chunk[{}] failed: {}\n",
++                    chunk,
++                    written
++                );
++                return;
++            }
++            if sym_idx_next == 0 {
++                return;
++            }
++            if sym_idx_next <= sym_idx {
++                pr_err!(
++                    "bifrost_guest: emit_symtab_for_file chunk[{}] no progress (idx={} -> {})\n",
++                    chunk,
++                    sym_idx,
++                    sym_idx_next
++                );
++                return;
++            }
++            sym_idx = sym_idx_next;
++        }
++        pr_err!(
++            "bifrost_guest: emit_symtab_for_file hit MAX_CHUNKS ({}) - symtab tail dropped\n",
++            MAX_CHUNKS
++        );
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

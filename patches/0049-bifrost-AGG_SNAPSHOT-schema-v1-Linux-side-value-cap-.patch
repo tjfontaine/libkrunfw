@@ -1,0 +1,222 @@
+From 1dd010e87362beca1059cc43c05d3d55b5453909 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Sun, 17 May 2026 11:32:34 -0700
+Subject: [PATCH 49/49] bifrost: AGG_SNAPSHOT schema v1 + Linux-side value-cap
+ widening
+
+agg_snapshot.rs:
+
+- PER_ROW_VAL_CAP widened 24 -> 1024 to match FreeBSD's
+  DTRACE_BIFROST_AGG_VAL_MAX so a future quantize-on-Linux
+  aggregator can publish without a lockstep wire bump.  Today's
+  BPF aggregators still only fill 8 bytes (scalar) or 24 bytes
+  (STDDEV triple) of the slot.
+- MAX_ENTRIES drops from 960 to 60 because the per-record reserve
+  cap stays at 65 536 bytes and the worst-case row jumped to 1068
+  bytes.  No existing demo packs >60 agg entries; overflow is
+  surfaced via SHMEM_DROP_CLASS_AGG.
+- Schema v1: write AGG_SNAPSHOT_SCHEMA_V1 at sub-header offset 16
+  and stamp the canonical AGG_SNAPSHOT_ROW_KIND_* byte into every
+  row's per-entry header.  The kernel-internal per-map agg-kind
+  flag is translated to the wire kind via `agg_snapshot_row_kind`.
+- Host's `ingest_agg_snapshot` now trusts the wire kind and skips
+  the source-text inference for v1 rows.
+
+wire.rs:
+
+- Re-vendored from the canonical (new
+  AGG_SNAPSHOT_SCHEMA_V1 / ROW_KIND_* constants).
+- CANONICAL_SHA256 pin updated; scripts/check-proto-drift.sh passes.
+---
+ drivers/bifrost/agg_snapshot.rs | 80 ++++++++++++++++++++++++++-------
+ drivers/bifrost/wire.rs         | 38 +++++++++++++++-
+ 2 files changed, 102 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/bifrost/agg_snapshot.rs b/drivers/bifrost/agg_snapshot.rs
+index ad538bd2394a..e3a3bd90609d 100644
+--- a/drivers/bifrost/agg_snapshot.rs
++++ b/drivers/bifrost/agg_snapshot.rs
+@@ -8,8 +8,30 @@
+ use crate::record_writer::RecordWriter;
+ use crate::wire::{
+     AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_KIND_STDDEV, AGG_SNAPSHOT_PROBE_ID,
+-    SHMEM_DROP_CLASS_AGG,
++    AGG_SNAPSHOT_ROW_KIND_AVG, AGG_SNAPSHOT_ROW_KIND_MAX, AGG_SNAPSHOT_ROW_KIND_MIN,
++    AGG_SNAPSHOT_ROW_KIND_STDDEV, AGG_SNAPSHOT_ROW_KIND_SUM, AGG_SNAPSHOT_ROW_KIND_UNKNOWN,
++    AGG_SNAPSHOT_SCHEMA_V1, SHMEM_DROP_CLASS_AGG,
+ };
++
++/// Translate the kernel-internal per-map agg-kind flag to the
++/// canonical AGG_SNAPSHOT_ROW_KIND_* discriminant stamped into
++/// every wire row under schema v1.  The Linux side currently has
++/// no QUANTIZE / LQUANTIZE / LLQUANTIZE aggregator, so unknown
++/// kinds surface as UNKNOWN — the host marks the row and
++/// continues.  Today's BPF programs only use SUM / MIN / MAX /
++/// AVG / STDDEV; COUNT is folded into SUM with a constant +1
++/// increment.
++fn agg_snapshot_row_kind(agg_kind_u8: u8) -> u8 {
++    match agg_kind_u8 {
++        // AGG_KIND_SUM = 0 from wire.rs
++        0 => AGG_SNAPSHOT_ROW_KIND_SUM,
++        AGG_KIND_MIN => AGG_SNAPSHOT_ROW_KIND_MIN,
++        AGG_KIND_MAX => AGG_SNAPSHOT_ROW_KIND_MAX,
++        AGG_KIND_AVG => AGG_SNAPSHOT_ROW_KIND_AVG,
++        AGG_KIND_STDDEV => AGG_SNAPSHOT_ROW_KIND_STDDEV,
++        _ => AGG_SNAPSHOT_ROW_KIND_UNKNOWN,
++    }
++}
+ use crate::{BifrostGuest, BIFROST_MAP_AGG_KIND, BIFROST_MAP_FAKE_FDS};
+ 
+ extern "C" {
+@@ -29,16 +51,33 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+         const HDR_BYTES: usize = 24;
+         const NUM_ENTRIES_BYTES: usize = 4;
+         const MAX_KEY_BYTES: usize = 32;
+-        // W5: per-row v_size header (u32) plus payload up to 24
+-        // bytes (STDDEV triple) — sum/min/max/avg use 8.
+-        const MAX_VAL_BYTES: usize = 24;
+-        const MAX_ENTRY_BYTES: usize = 4 + 4 + MAX_KEY_BYTES + 4 + MAX_VAL_BYTES;
+-        // BIFROST_RB_MAX_RECORD is 65 536; subtract the snapshot
+-        // header + entry-count u32 (28 bytes) and divide by the
+-        // worst-case per-row size (68 bytes after the W5
+-        // v_size + 24-byte STDDEV value extension) → 963 entries
+-        // per snapshot. Round down to 960 for a clean number.
+-        const MAX_ENTRIES: usize = 960;
++        // PER_ROW_VAL_CAP: max bytes a single row's value slot can
++        // carry on the wire.  Symmetric with FreeBSD's
++        // DTRACE_BIFROST_AGG_VAL_MAX = 1024 — wide enough for a
++        // full 127-bucket quantize array (8 *
++        // DTRACE_QUANTIZE_NBUCKETS = 1016, rounded up to 1024 for
++        // headroom).  Today's BPF aggregators only write 8 bytes
++        // (COUNT / SUM / MIN / MAX / AVG) or 24 bytes (STDDEV
++        // triple); a future quantize-on-Linux aggregator can land
++        // here without a wire bump in lockstep.  The host's
++        // `ingest_agg_snapshot` decoder caps at 4096, so 1024 fits.
++        const PER_ROW_VAL_CAP: usize = 1024;
++        const MAX_ENTRY_BYTES: usize = 4 + 4 + MAX_KEY_BYTES + 4 + PER_ROW_VAL_CAP;
++        // MAX_ENTRIES is bounded by `bifrost_shmem_reserve_kernel_
++        // class`'s per-record cap of 65 536 bytes:
++        //   (65 536 - 28) / (4 + 4 + 32 + 4 + 1024) = 61 entries.
++        // Round to 60 to leave a safety byte or two.  In practice
++        // most BPF aggregators emit 8-byte scalar values, but the
++        // reservation has to be sized for the worst case because
++        // pack_row doesn't know the value shapes ahead of time
++        // until it walks the per-CPU agg maps.  60 quantize-shaped
++        // rows is more than any real demo emits per snapshot; the
++        // earlier 960 figure was computed against the old 24-byte
++        // value cap and never reflected an actual demo working set.
++        // If a future session genuinely needs >60 rows, the AGG
++        // drop counter surfaces the overflow via the bifrost-wire
++        // SHMEM_DROP_CLASS_AGG bucket.
++        const MAX_ENTRIES: usize = 60;
+         const MAX_BODY: usize = HDR_BYTES + NUM_ENTRIES_BYTES + MAX_ENTRIES * MAX_ENTRY_BYTES;
+ 
+         let rec = bifrost_shmem_reserve_kernel_class(MAX_BODY as u32, SHMEM_DROP_CLASS_AGG)
+@@ -51,14 +90,22 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+         writer.write_u32(0);
+         writer.write_u32(AGG_SNAPSHOT_PROBE_ID);
+         writer.write_u64(bindings::ktime_get_mono_fast_ns());
+-        writer.write_u64(0);
++        // Schema v1: the previously-reserved u64 at sub-header
++        // offset 16 now carries the wire format schema version.  Any
++        // host decoder built before this commit will see a non-zero
++        // value here and fall back to the legacy path; the new
++        // decoder reads the kind byte stamped into each row.
++        writer.write_u64(AGG_SNAPSHOT_SCHEMA_V1);
+ 
+         let n_off = writer.off;
+         writer.write_u32(0);
+ 
+-        // Helper: pack one (fd, key, value) row into the writer.
+-        // Returns true on success, false on out-of-space (caller
+-        // rolls back). STDDEV writes 24 bytes, others 8.
++        // Helper: pack one (fd, kind, key, value) row into the
++        // writer.  Returns true on success, false on out-of-space
++        // (caller rolls back).  STDDEV writes 24 value bytes; the
++        // scalar shapes (SUM / MIN / MAX / AVG) write 8.  Every row
++        // carries the canonical AGG_SNAPSHOT_ROW_KIND_* tag so the
++        // host never has to scan source to recover the agg kind.
+         let mut packed: usize = 0;
+         let mut pack_row = |writer: &mut RecordWriter,
+                             fd: i32,
+@@ -69,6 +116,7 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+                             k_bytes: &[u8]|
+          -> bool {
+             let chk = writer.off;
++            let kind = agg_snapshot_row_kind(agg_kind);
+             let ok = match agg_kind {
+                 AGG_KIND_STDDEV => {
+                     let mut n: u64 = 0;
+@@ -85,6 +133,7 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+                         return false;
+                     }
+                     writer.write_i32(fd)
++                        && writer.write_bytes(&[kind, 0, 0, 0])
+                         && writer.write_u32(k_size)
+                         && writer.write_bytes(k_bytes)
+                         && writer.write_u32(24)
+@@ -104,6 +153,7 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
+                         return false;
+                     }
+                     writer.write_i32(fd)
++                        && writer.write_bytes(&[kind, 0, 0, 0])
+                         && writer.write_u32(k_size)
+                         && writer.write_bytes(k_bytes)
+                         && writer.write_u32(8)
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index be388ce758f4..1c8a8f66dfe2 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: 16e98621d4c8c0e44946c87d0d15bbbb3da3a581bb375fcd2037f0a7e9ffac0e
++// CANONICAL_SHA256: 89e11231c6fd7b175f763cd72bbfe3d03beed7461420d0e10e64ce344593f284
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -240,6 +240,42 @@
+ /// Aggregation-snapshot record.
+ pub const AGG_SNAPSHOT_PROBE_ID: u32 = 0xFFFFFFFD;
+ 
++// =====================================================================
++// AGG_SNAPSHOT schema versioning + per-row kind discriminant.
++//
++// Schema v1 stamps a `dtbar_action`-equivalent byte into every per-
++// entry row so the host no longer has to infer the aggregation kind
++// from a regex over the user's D source (the
++// `cli::agg_decl` scanner).  The schema version lives in the
++// previously-reserved u64 at sub-header offset 16.
++//
++// Kernel writers (FreeBSD `bifrost_conduit_publish_agg_snapshot`,
++// Linux `agg_snapshot::push_agg_snapshot`) translate their internal
++// action discriminants to these stable wire values.  The host's
++// `cli::orchestrate::ingest_agg_snapshot` detects the schema and
++// dispatches accordingly.
++// =====================================================================
++
++/// Schema version stamped at AGG_SNAPSHOT sub-header offset 16.
++///   v0 = legacy per-row `{ fd, k_size, key, v_size, value }`
++///   v1 = per-row `{ fd, kind, reserved[3], k_size, key, v_size, value }`
++pub const AGG_SNAPSHOT_SCHEMA_V0: u64 = 0;
++pub const AGG_SNAPSHOT_SCHEMA_V1: u64 = 1;
++
++/// Per-row kind discriminant for schema v1+.  Stable across kernels
++/// — both the FreeBSD bridge and the Linux agg snapshotter
++/// translate to these values when writing the wire.
++pub const AGG_SNAPSHOT_ROW_KIND_UNKNOWN: u8 = 0;
++pub const AGG_SNAPSHOT_ROW_KIND_COUNT: u8 = 1;
++pub const AGG_SNAPSHOT_ROW_KIND_SUM: u8 = 2;
++pub const AGG_SNAPSHOT_ROW_KIND_MIN: u8 = 3;
++pub const AGG_SNAPSHOT_ROW_KIND_MAX: u8 = 4;
++pub const AGG_SNAPSHOT_ROW_KIND_AVG: u8 = 5;
++pub const AGG_SNAPSHOT_ROW_KIND_STDDEV: u8 = 6;
++pub const AGG_SNAPSHOT_ROW_KIND_QUANTIZE: u8 = 7;
++pub const AGG_SNAPSHOT_ROW_KIND_LQUANTIZE: u8 = 8;
++pub const AGG_SNAPSHOT_ROW_KIND_LLQUANTIZE: u8 = 9;
++
+ /// Per-binary function-symbol-table push from the guest's
+ /// uprobe-register path.  See drivers/bifrost/bifrost_helpers.c
+ /// for the body wire format.
+-- 
+2.50.1 (Apple Git-155)
+

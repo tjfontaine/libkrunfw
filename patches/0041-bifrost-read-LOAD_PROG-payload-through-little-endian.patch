@@ -1,0 +1,617 @@
+From 077792f2962a9ddc543f64426ce180be773c74b6 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Tue, 12 May 2026 22:09:23 -0700
+Subject: bifrost: read LOAD_PROG payload through little-endian byte-copy
+ helpers
+
+The bounded LOAD_PROG parser introduced in commit 0040 carried a
+latent alignment bug: variable-length string trailers (host- and
+kernel-resolved uprobe paths/basenames/symbols, USDT provider/probe
+names) can leave the trailer-following `u64 file_offset`, the
+`MapDef` array base, the `num_insns` u32, the `BpfInsn` array base,
+and the reloc-trailer u32 fields on odd byte offsets relative to
+the kmalloc-backed `ctrl_buf`. The previous parser dereferenced
+those offsets through typed `*const u64` / `*const u32` /
+`*const MapDef` / `*const BpfInsn` casts; any odd-length string
+made the next aligned read undefined behavior on strict-alignment
+guest architectures.
+
+Replace every variable-offset typed read with explicit LE byte-copy
+helpers:
+
+  - `types::read_u32_le_unaligned(*const u8) -> u32`
+  - `types::read_u64_le_unaligned(*const u8) -> u64`
+  - `MapDef::read_le_unaligned(*const u8) -> MapDef`
+  - `BpfInsn::read_le_unaligned(*const u8) -> BpfInsn`
+  - `BpfInsn::write_le_unaligned(*mut u8, BpfInsn)`
+
+Each helper copies the wire bytes into a stack array and recomposes
+the fields through `u{32,64}::from_le_bytes`. Wire layout is
+unchanged; this is purely a correctness fix for how the parser
+reads the existing bytes.
+
+The kernel-resolved uprobe (`PROBE_TYPE_UPROBE_BY_SYM`), USDT, and
+host-resolved uprobe trailers are now covered by host-side odd-
+trailer fixtures in `host/bifrost/src/cli/direct_load.rs` that
+build LOAD_PROG payloads with adversarial string lengths and
+assert the alignment of the targeted u32/u64 fields plus a
+successful LE round-trip.
+
+Also refresh the canonical sha-pin in `wire.rs` to track the
+recent header refresh in `host/bifrost-wire/src/lib.rs`; the body
+of the vendored copy is otherwise unchanged.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/bifrost/bifrost.rs         |  79 ++++++++++++++------
+ drivers/bifrost/load_prog_parse.rs |  60 ++++++++++------
+ drivers/bifrost/types.rs           | 112 ++++++++++++++++++++++++++++-
+ drivers/bifrost/wire.rs            |  34 +++++----
+ 4 files changed, 225 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index e3640607748b..ddfbe8da5069 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -100,7 +100,9 @@
+     INITIAL_SLOT_HINT,
+ };
+ use symtab_snapshot::push_symtab_snapshot_cb;
+-use types::{BifrostCmd, BpfInsn, MapDef};
++use types::{
++    read_u32_le_unaligned, BifrostCmd, BpfInsn, MapDef, BPF_INSN_WIRE_SIZE, MAP_DEF_WIRE_SIZE,
++};
+ use shmem_layout::{
+     SHMEM_BTF_CAP, SHMEM_BTF_OFF, SHMEM_HDR_LEN, SHMEM_HDR_OFF, SHMEM_KSYMS_CAP, SHMEM_KSYMS_OFF,
+     SHMEM_MAGIC, SHMEM_N_PAGES, SHMEM_REGION_SIZE, SHMEM_RINGBUF_LEN, SHMEM_RINGBUF_OFF,
+@@ -522,12 +524,15 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                         let uprobe_file_offset = layout.uprobe_file_offset;
+ 
+                         let maps_base = payload_base.add(layout.maps_off);
+-                        // MapDef is 24 bytes (4×u32 + i32 + u32 flags with
+-                        // agg_kind in the low byte). The parser already
+-                        // validated `num_maps * MAP_DEF_SIZE` fits within
+-                        // the declared payload.
+-                        let map_def_size = core::mem::size_of::<MapDef>();
+-                        
++                        // MapDef is 24 bytes (4×u32 + i32 + u32 flags
++                        // with agg_kind in the low byte). The parser
++                        // already validated `num_maps * MAP_DEF_WIRE_SIZE`
++                        // fits within the declared payload. The array
++                        // base offset can be odd (variable-length string
++                        // trailers above), so reads must go through the
++                        // little-endian byte-copy helper.
++                        let map_def_size = MAP_DEF_WIRE_SIZE;
++
+                         // --- Phase 1: Parse maps, allocate bpf_map via
+                         // the standard kernel allocator path. Map types
+                         // remaining in use post-SHMEM-migration are
+@@ -537,7 +542,9 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                         // SHMEM data plane.
+                         for i in 0..num_maps as usize {
+                             if i >= 8 { break; }
+-                            let map_def = &*(maps_base.add(i * map_def_size) as *const MapDef);
++                            let map_def =
++                                MapDef::read_le_unaligned(maps_base.add(i * map_def_size));
++                            let map_def = &map_def;
+ 
+                             // Dedup across LOAD_PROGs: if this fake_fd matches
+                             // a map we already allocated (e.g. the shared
+@@ -622,7 +629,8 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                         // program's verify) and the verifier rejects with
+                         // "fd N is not pointing to valid bpf_map".
+                         for i in 0..num_maps as usize {
+-                            let map_def = &*(maps_base.add(i * map_def_size) as *const MapDef);
++                            let map_def =
++                                MapDef::read_le_unaligned(maps_base.add(i * map_def_size));
+                             let slot = (0..(*bg).num_maps as usize)
+                                 .find(|&j| BIFROST_MAP_FAKE_FDS[j] == map_def.fake_fd);
+                             let Some(slot) = slot else { continue };
+@@ -647,11 +655,22 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                         // --- Phase 2: Parse BPF instructions ---
+                         // Offsets/counts come from the parser-produced layout;
+                         // we never re-derive them from raw pointer math here.
++                        // Variable-length string trailers above can leave
++                        // `insns_off` on an odd byte, so per-instruction
++                        // reads and writes go through the LE byte-copy
++                        // helpers on `BpfInsn`.
+                         let num_insns = layout.num_insns;
+-                        let insns_base = payload_base.add(layout.insns_off) as *mut BpfInsn;
++                        let insns_base = payload_base.add(layout.insns_off) as *mut u8;
++                        // SAFETY: parser already bounded `num_insns *
++                        // BPF_INSN_WIRE_SIZE` against the declared
++                        // payload length; callers pass indices below
++                        // `num_insns`.
++                        let insn_at = |i: u32| -> *mut u8 {
++                            unsafe { insns_base.add((i as usize) * BPF_INSN_WIRE_SIZE) }
++                        };
+ 
+                         pr_info!("bifrost_guest: {} BPF instructions received\n", num_insns);
+-                        
++
+                         // --- Phase 3: Patch instructions ---
+                         // Single path: rewrite LD_IMM64 fake_fd→real_fd for
+                         // every map reference; leave BPF_CALL alone (the
+@@ -659,7 +678,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                         // The bypass-verifier path retired (goal item 5).
+                         let mut idx = 0u32;
+                         while idx < num_insns {
+-                            let insn = &mut *insns_base.add(idx as usize);
++                            let insn = BpfInsn::read_le_unaligned(insn_at(idx));
+ 
+                             if insn.code == 0x18 && insn.src_reg() == 1 {
+                                 let fake_fd = insn.imm;
+@@ -674,13 +693,17 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                     let j = map_slot as usize;
+                                     let real_fd = BIFROST_MAP_REAL_FDS[j];
+                                     if real_fd >= 0 {
+-                                        insn.imm = real_fd;
++                                        let mut patched = insn;
++                                        patched.imm = real_fd;
+                                         // Keep src_reg=BPF_PSEUDO_MAP_FD(1) — the
+                                         // verifier flips this to MAP_VALUE/PTR
+                                         // and rewrites imm to the kernel addr.
++                                        BpfInsn::write_le_unaligned(insn_at(idx), patched);
+                                         if idx + 1 < num_insns {
+-                                            let insn2 = &mut *insns_base.add((idx + 1) as usize);
++                                            let mut insn2 =
++                                                BpfInsn::read_le_unaligned(insn_at(idx + 1));
+                                             insn2.imm = 0;
++                                            BpfInsn::write_le_unaligned(insn_at(idx + 1), insn2);
+                                         }
+                                     }
+                                 }
+@@ -731,10 +754,18 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                 reloc_failure_detail[..n].copy_from_slice(&msg[..n]);
+                                 reloc_failure_detail_len = n;
+                             } else {
++                                // Reloc trailer entries may land on any
++                                // byte alignment (the `u8 name_len` field
++                                // makes the next `u32 insn_idx` follow at
++                                // 4+1+name_len = name_len+5 bytes — odd
++                                // whenever name_len is even). Reads use
++                                // the LE byte-copy helper; the patched
++                                // `imm` write goes through
++                                // `BpfInsn::write_le_unaligned`.
+                                 let mut walk = relocs_base.add(4);
+                                 let mut name_buf = [0u8; 256];
+                                 for _ in 0..num_relocs {
+-                                    let insn_idx = *(walk as *const u32) as usize;
++                                    let insn_idx = read_u32_le_unaligned(walk) as usize;
+                                     walk = walk.add(4);
+                                     let name_len = *walk as usize;
+                                     walk = walk.add(1);
+@@ -782,8 +813,10 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                         reloc_failure_detail_len = copy;
+                                         break;
+                                     }
+-                                    let target_insn = &mut *insns_base.add(insn_idx);
++                                    let target_ptr = insn_at(insn_idx as u32);
++                                    let mut target_insn = BpfInsn::read_le_unaligned(target_ptr);
+                                     target_insn.imm = btf_id;
++                                    BpfInsn::write_le_unaligned(target_ptr, target_insn);
+                                     let nm = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("?");
+                                     pr_info!(
+                                         "bifrost_guest:   reloc insn[{}] '{}' -> btf_id {}\n",
+@@ -841,7 +874,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                             continue;
+                         }
+ 
+-                        let insn_bytes = (num_insns as usize) * 8;
++                        let insn_bytes = (num_insns as usize) * BPF_INSN_WIRE_SIZE;
+                         let prog = bpf_prog_alloc(insn_bytes as u32, bindings::GFP_KERNEL);
+                         let mut prog_ok = false;
+                         if !prog.is_null() {
+@@ -853,12 +886,14 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                             // bpf_check; the manual override the bypass path
+                             // needed is gone.
+ 
++                            // `dst` (inside the freshly allocated
++                            // `bpf_prog`) is `bpf_insn`-aligned, but
++                            // `insns_base` may be on an odd byte (variable
++                            // string trailers). `copy_nonoverlapping`
++                            // through `*mut u8` is correct for either
++                            // alignment.
+                             let dst = &mut (*prog).__bindgen_anon_1 as *mut _ as *mut u8;
+-                            core::ptr::copy_nonoverlapping(
+-                                insns_base as *const u8,
+-                                dst,
+-                                insn_bytes,
+-                            );
++                            core::ptr::copy_nonoverlapping(insns_base, dst, insn_bytes);
+ 
+                             // fbt:: probes (PROBE_TYPE_FENTRY/FEXIT): override
+                             // the kprobe defaults set above to put the prog
+diff --git a/drivers/bifrost/load_prog_parse.rs b/drivers/bifrost/load_prog_parse.rs
+index 79a9d4119f21..9135db1f5da4 100644
+--- a/drivers/bifrost/load_prog_parse.rs
++++ b/drivers/bifrost/load_prog_parse.rs
+@@ -13,7 +13,10 @@
+ use kernel::prelude::*;
+ 
+ use crate::bpf_consts::{BPF_LD_IMM64, BPF_PSEUDO_MAP_FD};
+-use crate::types::{BifrostCmd, BpfInsn, MapDef};
++use crate::types::{
++    read_u32_le_unaligned, read_u64_le_unaligned, BifrostCmd, BpfInsn, MapDef,
++    BPF_INSN_WIRE_SIZE, MAP_DEF_WIRE_SIZE,
++};
+ use crate::wire::{
+     PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM,
+     PROBE_TYPE_USDT,
+@@ -101,12 +104,18 @@ pub(crate) unsafe fn parse_load_prog(
+     unsafe {
+         const CMD_HDR: usize = core::mem::size_of::<BifrostCmd>();
+         const FIXED: usize = 4 + 32 + 4;
+-        const MAP_DEF_SIZE: usize = core::mem::size_of::<MapDef>();
+-        const INSN_SIZE: usize = core::mem::size_of::<BpfInsn>();
+ 
+         if cmd.is_null() || (cmd_len as usize) < CMD_HDR {
+             return Err(-(bindings::EINVAL as i32));
+         }
++        // `BifrostCmd` header is naturally 4-aligned and lives at
++        // the start of the kmalloc-backed control buffer; the `len`
++        // field load here is the only typed read against `cmd`
++        // itself. Everything after the header (the payload) is
++        // accessed through `read_u32_le_unaligned` /
++        // `read_u64_le_unaligned` / `{MapDef, BpfInsn}::read_le_unaligned`
++        // so variable-length string trailers cannot leave a later
++        // wide field on an odd offset.
+         let declared = (*cmd).len as usize;
+         let avail = (cmd_len as usize).saturating_sub(CMD_HDR);
+         if declared > avail || declared < FIXED {
+@@ -130,9 +139,9 @@ pub(crate) unsafe fn parse_load_prog(
+         if !need(0, FIXED) {
+             return Err(-(bindings::EINVAL as i32));
+         }
+-        layout.num_maps = *(base as *const u32);
++        layout.num_maps = read_u32_le_unaligned(base);
+         core::ptr::copy_nonoverlapping(base.add(4), layout.target_name.as_mut_ptr(), 32);
+-        layout.flags = *(base.add(4 + 32) as *const u32);
++        layout.flags = read_u32_le_unaligned(base.add(4 + 32));
+         layout.probe_type = (layout.flags & 0xff) as u8;
+ 
+         let mut off = FIXED;
+@@ -143,7 +152,7 @@ pub(crate) unsafe fn parse_load_prog(
+                 if !need(off, 4) {
+                     return Err(-(bindings::EINVAL as i32));
+                 }
+-                let path_len = *(base.add(off) as *const u32) as usize;
++                let path_len = read_u32_le_unaligned(base.add(off)) as usize;
+                 off += 4;
+                 if path_len > UPROBE_PATH_MAX || !need(off, path_len) {
+                     pr_err!(
+@@ -163,14 +172,18 @@ pub(crate) unsafe fn parse_load_prog(
+                 if !need(off, 8) {
+                     return Err(-(bindings::EINVAL as i32));
+                 }
+-                layout.uprobe_file_offset = *(base.add(off) as *const u64);
++                // `path_len` is attacker-controlled, so this u64 lands
++                // on `4+32+4+4+path_len` — odd whenever path_len is
++                // odd. The unaligned helper byte-copies through a
++                // stack array.
++                layout.uprobe_file_offset = read_u64_le_unaligned(base.add(off));
+                 off += 8;
+             }
+             PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => {
+                 if !need(off, 4) {
+                     return Err(-(bindings::EINVAL as i32));
+                 }
+-                let bn_len = *(base.add(off) as *const u32) as usize;
++                let bn_len = read_u32_le_unaligned(base.add(off)) as usize;
+                 off += 4;
+                 if bn_len == 0 || bn_len > UPROBE_BASENAME_MAX || !need(off, bn_len) {
+                     pr_err!(
+@@ -190,7 +203,7 @@ pub(crate) unsafe fn parse_load_prog(
+                 if !need(off, 4) {
+                     return Err(-(bindings::EINVAL as i32));
+                 }
+-                let sym_len = *(base.add(off) as *const u32) as usize;
++                let sym_len = read_u32_le_unaligned(base.add(off)) as usize;
+                 off += 4;
+                 if sym_len == 0 || sym_len > UPROBE_SYMBOL_MAX || !need(off, sym_len) {
+                     pr_err!(
+@@ -212,7 +225,7 @@ pub(crate) unsafe fn parse_load_prog(
+                 if !need(off, 4) {
+                     return Err(-(bindings::EINVAL as i32));
+                 }
+-                let bn_len = *(base.add(off) as *const u32) as usize;
++                let bn_len = read_u32_le_unaligned(base.add(off)) as usize;
+                 off += 4;
+                 if bn_len == 0 || bn_len > UPROBE_BASENAME_MAX || !need(off, bn_len) {
+                     pr_err!(
+@@ -232,7 +245,7 @@ pub(crate) unsafe fn parse_load_prog(
+                 if !need(off, 4) {
+                     return Err(-(bindings::EINVAL as i32));
+                 }
+-                let prov_len = *(base.add(off) as *const u32) as usize;
++                let prov_len = read_u32_le_unaligned(base.add(off)) as usize;
+                 off += 4;
+                 if prov_len == 0 || prov_len > UPROBE_PROVIDER_MAX || !need(off, prov_len) {
+                     pr_err!(
+@@ -252,7 +265,7 @@ pub(crate) unsafe fn parse_load_prog(
+                 if !need(off, 4) {
+                     return Err(-(bindings::EINVAL as i32));
+                 }
+-                let probe_len = *(base.add(off) as *const u32) as usize;
++                let probe_len = read_u32_le_unaligned(base.add(off)) as usize;
+                 off += 4;
+                 if probe_len == 0 || probe_len > UPROBE_SYMBOL_MAX || !need(off, probe_len) {
+                     pr_err!(
+@@ -273,7 +286,10 @@ pub(crate) unsafe fn parse_load_prog(
+             _ => {}
+         }
+ 
+-        // MapDef array.
++        // MapDef array. We only validate length and stash an offset
++        // here — dispatch reads MapDef fields via
++        // `MapDef::read_le_unaligned` because variable-length string
++        // trailers above can leave `maps_off` on an odd byte.
+         if (layout.num_maps as usize) > MAX_MAPS_PER_PROG {
+             pr_err!(
+                 "bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap {}\n",
+@@ -282,7 +298,7 @@ pub(crate) unsafe fn parse_load_prog(
+             );
+             return Err(-(bindings::EINVAL as i32));
+         }
+-        let map_bytes = match (layout.num_maps as usize).checked_mul(MAP_DEF_SIZE) {
++        let map_bytes = match (layout.num_maps as usize).checked_mul(MAP_DEF_WIRE_SIZE) {
+             Some(v) => v,
+             None => return Err(-(bindings::EINVAL as i32)),
+         };
+@@ -297,9 +313,9 @@ pub(crate) unsafe fn parse_load_prog(
+             return Err(-(bindings::EINVAL as i32));
+         }
+         layout.insns_header_off = off;
+-        layout.num_insns = *(base.add(off) as *const u32);
++        layout.num_insns = read_u32_le_unaligned(base.add(off));
+         off += 4;
+-        let insn_bytes = match (layout.num_insns as usize).checked_mul(INSN_SIZE) {
++        let insn_bytes = match (layout.num_insns as usize).checked_mul(BPF_INSN_WIRE_SIZE) {
+             Some(v) => v,
+             None => return Err(-(bindings::EINVAL as i32)),
+         };
+@@ -308,12 +324,12 @@ pub(crate) unsafe fn parse_load_prog(
+         }
+         layout.insns_off = off;
+ 
+-        // LD_IMM64 pseudo-fd insns occupy two slots; the second slot must
+-        // exist. Walk to catch a truncated trailing pair.
+-        let insns = base.add(off) as *const BpfInsn;
++        // LD_IMM64 pseudo-fd insns occupy two slots; the second slot
++        // must exist. Walk to catch a truncated trailing pair.
++        let insns_base = base.add(off);
+         let mut idx = 0usize;
+         while idx < layout.num_insns as usize {
+-            let insn = &*insns.add(idx);
++            let insn = BpfInsn::read_le_unaligned(insns_base.add(idx * BPF_INSN_WIRE_SIZE));
+             if insn.code == BPF_LD_IMM64 && insn.src_reg() == BPF_PSEUDO_MAP_FD {
+                 if idx + 1 >= layout.num_insns as usize {
+                     pr_err!("bifrost_guest: LOAD_PROG ldimm64 at final insn {}\n", idx);
+@@ -331,13 +347,13 @@ pub(crate) unsafe fn parse_load_prog(
+             return Err(-(bindings::EINVAL as i32));
+         }
+         layout.relocs_off = off;
+-        layout.num_relocs = *(base.add(off) as *const u32);
++        layout.num_relocs = read_u32_le_unaligned(base.add(off));
+         off += 4;
+         for _ in 0..layout.num_relocs as usize {
+             if !need(off, 5) {
+                 return Err(-(bindings::EINVAL as i32));
+             }
+-            let insn_idx = *(base.add(off) as *const u32) as usize;
++            let insn_idx = read_u32_le_unaligned(base.add(off)) as usize;
+             off += 4;
+             let name_len = *base.add(off) as usize;
+             off += 1;
+diff --git a/drivers/bifrost/types.rs b/drivers/bifrost/types.rs
+index 75979f500453..074cf91c517d 100644
+--- a/drivers/bifrost/types.rs
++++ b/drivers/bifrost/types.rs
+@@ -4,7 +4,7 @@
+ // Wire-format struct types shared with the host across the
+ // VQ_CTRL / LOAD_PROG path:
+ //   - `BifrostCmd`: virtio cmd header (op + len + inline data).
+-//   - `MapDef`: per-map LOAD_PROG payload entry (20 numeric bytes
++//   - `MapDef`: per-map LOAD_PROG payload entry (24 numeric bytes
+ //     mirroring the host emit side at
+ //     `host/bifrost/src/cli/wrapper.rs::MapDecl`, plus a 32-byte
+ //     name on the host side that's stripped at the libkrun edge).
+@@ -14,6 +14,22 @@
+ // All `#[repr(C)]` so the layout is stable and compatible with the
+ // host's emit code.  Fields are `pub(crate)` so sibling modules
+ // in this driver can access them without going through getters.
++//
++// Wire byte order is little-endian throughout (the host CLI emits
++// LE and both supported guest architectures are LE). The wire
++// payload starts immediately after the 8-byte `BifrostCmd` header
++// inside a `kmalloc`-backed control buffer. The 8-byte header is
++// 8-aligned, but the variable-length string trailers that follow
++// `flags` can land any subsequent fixed-width field on an odd
++// offset (e.g. a 13-byte uprobe path leaves the `u64 file_offset`
++// at offset 4+32+4+4+13 = 57). The aligned typed reads the
++// previous parser used were therefore undefined behavior on the
++// kernel-build target. Replace with the `read_le_*` /
++// `MapDef::read_le_unaligned` / `BpfInsn::read_le_unaligned`
++// helpers below, which copy bytes through a stack array and
++// recompose via `from_le_bytes`. They compile to a `memcpy + bswap?`
++// pair the JIT collapses, and they are correct for any byte
++// alignment.
+ 
+ #[repr(C)]
+ pub(crate) struct BifrostCmd {
+@@ -22,7 +38,7 @@ pub(crate) struct BifrostCmd {
+     pub(crate) data: [u8; 0],
+ }
+ 
+-/// Map definition received from host in LOAD_PROG payload (20 bytes).
++/// Map definition received from host in LOAD_PROG payload (24 bytes).
+ #[repr(C)]
+ #[derive(Copy, Clone)]
+ pub(crate) struct MapDef {
+@@ -37,6 +53,38 @@ pub(crate) struct MapDef {
+     pub(crate) flags: u32,
+ }
+ 
++/// On-wire size of [`MapDef`]. Pinned here rather than relying on
++/// `size_of::<MapDef>()` so the parser and dispatch sites stay in
++/// lockstep with the host emit width if the struct ever gains
++/// padding.
++pub(crate) const MAP_DEF_WIRE_SIZE: usize = 24;
++
++/// On-wire size of [`BpfInsn`]. Same rationale as
++/// [`MAP_DEF_WIRE_SIZE`].
++pub(crate) const BPF_INSN_WIRE_SIZE: usize = 8;
++
++impl MapDef {
++    /// Decode a [`MapDef`] from a possibly-unaligned wire pointer.
++    ///
++    /// Caller must guarantee `p..p+MAP_DEF_WIRE_SIZE` is readable.
++    /// Bytes are interpreted little-endian regardless of host or
++    /// guest endianness.
++    #[inline]
++    pub(crate) unsafe fn read_le_unaligned(p: *const u8) -> Self {
++        let mut buf = [0u8; MAP_DEF_WIRE_SIZE];
++        // SAFETY: caller asserts MAP_DEF_WIRE_SIZE bytes are readable.
++        unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), MAP_DEF_WIRE_SIZE) };
++        Self {
++            map_type: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
++            key_size: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
++            value_size: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
++            max_entries: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
++            fake_fd: i32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
++            flags: u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
++        }
++    }
++}
++
+ /// BPF instruction layout (8 bytes).
+ #[repr(C)]
+ #[derive(Copy, Clone)]
+@@ -55,4 +103,64 @@ pub(crate) fn src_reg(&self) -> u8 {
+     pub(crate) fn set_src_reg(&mut self, r: u8) {
+         self.regs = (self.regs & 0x0f) | (r << 4);
+     }
++
++    /// Decode a [`BpfInsn`] from a possibly-unaligned wire pointer.
++    ///
++    /// Caller must guarantee `p..p+BPF_INSN_WIRE_SIZE` is readable.
++    #[inline]
++    pub(crate) unsafe fn read_le_unaligned(p: *const u8) -> Self {
++        let mut buf = [0u8; BPF_INSN_WIRE_SIZE];
++        // SAFETY: caller asserts BPF_INSN_WIRE_SIZE bytes are readable.
++        unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), BPF_INSN_WIRE_SIZE) };
++        Self {
++            code: buf[0],
++            regs: buf[1],
++            off: i16::from_le_bytes([buf[2], buf[3]]),
++            imm: i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
++        }
++    }
++
++    /// Store a [`BpfInsn`] back through a possibly-unaligned wire
++    /// pointer in little-endian byte order.
++    ///
++    /// Caller must guarantee `p..p+BPF_INSN_WIRE_SIZE` is writable.
++    #[inline]
++    pub(crate) unsafe fn write_le_unaligned(p: *mut u8, v: BpfInsn) {
++        let off_bytes = v.off.to_le_bytes();
++        let imm_bytes = v.imm.to_le_bytes();
++        let buf = [
++            v.code,
++            v.regs,
++            off_bytes[0],
++            off_bytes[1],
++            imm_bytes[0],
++            imm_bytes[1],
++            imm_bytes[2],
++            imm_bytes[3],
++        ];
++        // SAFETY: caller asserts BPF_INSN_WIRE_SIZE bytes are writable.
++        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), p, BPF_INSN_WIRE_SIZE) };
++    }
++}
++
++/// Read a little-endian `u32` from a possibly-unaligned pointer.
++///
++/// # Safety
++/// `p..p+4` must be readable.
++#[inline]
++pub(crate) unsafe fn read_u32_le_unaligned(p: *const u8) -> u32 {
++    let mut buf = [0u8; 4];
++    unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), 4) };
++    u32::from_le_bytes(buf)
++}
++
++/// Read a little-endian `u64` from a possibly-unaligned pointer.
++///
++/// # Safety
++/// `p..p+8` must be readable.
++#[inline]
++pub(crate) unsafe fn read_u64_le_unaligned(p: *const u8) -> u64 {
++    let mut buf = [0u8; 8];
++    unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), 8) };
++    u64::from_le_bytes(buf)
+ }
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index a1fa11ed2ab6..b79a9ecd9723 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: 9f8779b23cebea9ea83daae30d07c1ba076508587b683056bbc02dea9fa9d78b
++// CANONICAL_SHA256: be23041b61b3e776065ba712b028de6e701717a7ea0d100009c3129e848b59b5
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -9,21 +9,27 @@
+ // a matching re-vendor from the canonical.
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+ //
+-// Wire-format contract shared across the three bifrost layers.
+-// This file is the **canonical** source.  The other two layers
+-// (libkrun virtio device, guest kernel module) consume it via
+-// SYMLINK rather than vendoring + lint-diff:
++// Wire-format contract for the Bifrost semantic protocol.  This
++// file is the **canonical** source.  Other layers consume it:
+ //
+-//   third_party/smolvm/libkrun/src/devices/src/virtio/bifrost/wire.rs
+-//     → ../../../../../../bifrost-wire/src/lib.rs (resolves via the
+-//        smolvm-level `bifrost-wire -> ../../host/bifrost-wire` symlink)
++//   guest kernel module:
++//     third_party/linux-bifrost/drivers/bifrost/wire.rs
++//       — VENDORED COPY with a SHA-pinned header.  The kernel
++//         build runs inside a krunvm with only libkrunfw/ mounted,
++//         so a symlink to host/bifrost-wire/src/lib.rs would not
++//         resolve at build time.  Vendoring + SHA pin gives the
++//         same anti-drift guarantee with manual sync discipline;
++//         the pin is audited by scripts/check-proto-drift.sh.
+ //
+-//   third_party/linux-bifrost/drivers/bifrost/wire.rs
+-//     → ../../../../host/bifrost-wire/src/lib.rs
++//   libkrun (vmm/devices crate):
++//     Does **not** consume this file.  The libkrun-side virtio
++//     adapter at third_party/smolvm/libkrun/src/devices/src/
++//     virtio/conduit/mod.rs treats Bifrost LOAD_PROG payloads as
++//     opaque bytes; only the **generic** virtio-conduit transport
++//     constants (KIND_*, ring layout) cross the libkrun boundary,
++//     and those live in host/virtio-conduit/, not here.
+ //
+-// Symlinking means there is exactly one set of bytes to maintain;
+-// the body-diff lint dance the previous vendoring approach
+-// required is gone.  Tests for the constants live in
++// Tests for the constants live in
+ // `host/bifrost-wire/tests/constant_pins.rs` (out of this file
+ // so kernel-rust isn't asked to parse a `mod tests` block that
+ // references std-only macros).
+@@ -35,7 +41,7 @@
+ // when the same bytes ship in both licensing contexts.
+ //
+ // `#![no_std]` so this lives equally well in the host CLI's full
+-// std crate, the libkrun host VMM, and the guest kernel module.
++// std crate and the guest kernel module.
+ //
+ // Visibility: `pub` is correct on the canonical/host side (the
+ // crate root re-exports it).  Kernel-rust warns "unreachable pub
+-- 
+2.50.1 (Apple Git-155)
+

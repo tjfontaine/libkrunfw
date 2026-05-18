@@ -1,0 +1,38 @@
+From d99aa2538341078e9a9713a675132e5585967af5 Mon Sep 17 00:00:00 2001
+From: Asahi Lina <lina@asahilina.net>
+Date: Mon, 21 Oct 2024 23:21:16 +0900
+Subject: [PATCH 19/28] 
+ 0019-mm-Fix-__wp_page_copy_user-fallback-path-for-remote-: mm: Fix
+ __wp_page_copy_user fallback path for remote mm
+
+---
+ mm/memory.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index 090e9c6f9992..9c09dd2d3cbe 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3081,13 +3081,18 @@ static inline int __wp_page_copy_user(struct page *dst, struct page *src,
+ 			update_mmu_cache_range(vmf, vma, addr, vmf->pte, 1);
+ 	}
+ 
++	/* If the mm is a remote mm, copy in the page using access_remote_vm() */
++	if (current->mm != mm) {
++		if (access_remote_vm(mm, (unsigned long)uaddr, kaddr, PAGE_SIZE, 0) != PAGE_SIZE)
++			goto warn;
++	}
+ 	/*
+ 	 * This really shouldn't fail, because the page is there
+ 	 * in the page tables. But it might just be unreadable,
+ 	 * in which case we just give up and fill the result with
+ 	 * zeroes.
+ 	 */
+-	if (__copy_from_user_inatomic(kaddr, uaddr, PAGE_SIZE)) {
++	else if (__copy_from_user_inatomic(kaddr, uaddr, PAGE_SIZE)) {
+ 		if (vmf->pte)
+ 			goto warn;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

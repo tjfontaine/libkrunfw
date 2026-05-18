@@ -1,0 +1,465 @@
+From 1af0edb1b4ce6695a224fe6dacd8ac5ca0603dd0 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Wed, 13 May 2026 11:58:34 -0700
+Subject: bifrost: carve the SHMEM principal ring into per-CPU sub-rings
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Goal-roadmap workstream 1. The single 16 MB SHMEM ring with one
+producer/consumer cursor pair was the practical throughput
+ceiling under hot workloads: every guest CPU CAS-claimed into
+the same `producer_pos`, and the compile-profile demo at
+FIRE_GAP=0.05 dropped 1.7M records per 16 s window because of
+cross-CPU cache-line contention on that single cursor.
+
+This commit carves the 6 MB ringbuf area into N sub-rings of
+length `ringbuf_len / N` each, where N = min(num_possible_cpus(),
+BIFROST_NUM_CPUS_MAX=16). Producer (BPF program) picks its
+sub-ring via `smp_processor_id() % num_cpus`. Consumer (host
+renderer) round-robins drain across all sub-rings.
+
+Header layout changes (SHMEM_VERSION bump 3 → 4, breaking — per
+project policy we don't care about backward compatibility):
+
+  struct bifrost_shmem_ringbuf_hdr {
+      u32 magic, version;
+      u64 region_len, ringbuf_off, ringbuf_len;
+      u64 btf_off, btf_len, ksyms_off, ksyms_len;
+      u64 vma_cache_off, vma_cache_len;
+      u32 num_cpus, per_cpu_state_stride;
+      u64 per_cpu_ring_len, per_cpu_state_off;
+      u8 _pad[24];
+      // at offset 128: NUM_CPUS_MAX cache-line-aligned entries
+      struct bifrost_shmem_per_cpu per_cpu[BIFROST_NUM_CPUS_MAX];
+  };
+
+  struct bifrost_shmem_per_cpu {
+      atomic64_t producer_pos, consumer_pos;
+      atomic64_t dropped_records, dropped_bytes;
+      u8 _pad[32];  // one cache line
+  };
+
+`bifrost_shmem_reserve_kernel` picks its CPU's sub-ring up front
+(modulo num_cpus on hosts > BIFROST_NUM_CPUS_MAX) and does the
+existing atomic CAS + wraparound + padding logic against that
+sub-ring's cursors. The wraparound padding record now wraps
+within the CPU's sub-ring, not globally.
+
+`bifrost_kfunc_shmem_kick` reads this CPU's producer/consumer
+distance instead of the global one — kick fires when this CPU's
+sub-ring has fallen behind, not when the aggregate has. Reduces
+false-positive kicks across idle CPUs while still firing
+promptly on the busy one.
+
+Cross-layer constants pinned:
+- drivers/bifrost/wire.rs SHMEM_VERSION=4, SHMEM_NUM_CPUS_MAX=16,
+  SHMEM_PER_CPU_STATE_OFF=128, SHMEM_PER_CPU_STATE_STRIDE=64.
+- drivers/bifrost/shmem_layout.rs mirrors the same constants.
+- Canonical SHA pin in the vendored wire.rs refreshed (host
+  canonical is host/bifrost-wire/src/lib.rs).
+
+The host-side DataShmSnapshot and direct-render thread are
+updated in a paired host-tree commit; the two layers must land
+together because SHMEM_VERSION bumped.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/bifrost/shmem_layout.rs |  27 ++++-
+ drivers/bifrost/wire.rs         |  22 +++-
+ kernel/bpf/helpers.c            | 200 +++++++++++++++++++++++---------
+ 3 files changed, 189 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/bifrost/shmem_layout.rs b/drivers/bifrost/shmem_layout.rs
+index 00de89cfccfb..1f8fa3b863b3 100644
+--- a/drivers/bifrost/shmem_layout.rs
++++ b/drivers/bifrost/shmem_layout.rs
+@@ -23,8 +23,31 @@
+ /// the same memory. ASCII 'BFSH' interpreted as little-endian.
+ pub(crate) const SHMEM_MAGIC: u32 = 0x48534642;
+ /// Layout version stored next to the magic. Bumped whenever the
+-/// header layout changes incompatibly.
+-pub(crate) const SHMEM_VERSION: u32 = 3;
++/// header layout changes incompatibly. V4: per-CPU principal
++/// buffer carve (W1). The 6 MB `SHMEM_RINGBUF_LEN` is divided
++/// equally across `BIFROST_NUM_CPUS_MAX` sub-rings; the host
++/// reads `num_cpus` / `per_cpu_ring_len` from the in-region
++/// header so it always sees the actual chosen carve.
++pub(crate) const SHMEM_VERSION: u32 = 4;
++
++/// Cap on per-CPU sub-rings. Hosts with more CPUs share a
++/// sub-ring (modulo `num_cpus` selection at reserve time);
++/// hosts with fewer leave the upper sub-rings unused. Mirrors
++/// the `BIFROST_NUM_CPUS_MAX` define in
++/// `kernel/bpf/helpers.c`. The host-side mirror lives in
++/// `host/bifrost-wire/src/lib.rs` as `SHMEM_NUM_CPUS_MAX` for
++/// the cross-layer drift script.
++pub(crate) const SHMEM_NUM_CPUS_MAX: u32 = 16;
++
++/// Byte offset of the per-CPU state array within the SHMEM
++/// header page. Each entry is one cache line. Cross-layer drift
++/// pinned in `bifrost-wire` as `SHMEM_PER_CPU_STATE_OFF`.
++pub(crate) const SHMEM_PER_CPU_STATE_OFF: u32 = 128;
++
++/// Stride between successive CPU state entries (one cache
++/// line). Cross-layer drift pinned in `bifrost-wire` as
++/// `SHMEM_PER_CPU_STATE_STRIDE`.
++pub(crate) const SHMEM_PER_CPU_STATE_STRIDE: u32 = 64;
+ 
+ /// Phase 3a SHMEM sub-region layout (offsets within the 16 MB
+ /// region, all 4 KB aligned). Kept in sync with the host's
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index b79a9ecd9723..ebafa6682c0a 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: be23041b61b3e776065ba712b028de6e701717a7ea0d100009c3129e848b59b5
++// CANONICAL_SHA256: 4549cfc92f0cf601db5d4faf507548695783b5a286b7d2b91f16561c25938cb7
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -630,8 +630,24 @@
+ /// sees the same memory. ASCII `BFSH` interpreted as little-endian.
+ pub const SHMEM_MAGIC: u32 = 0x48534642;
+ /// Layout version stored next to `SHMEM_MAGIC`. Bump when the SHMEM
+-/// header layout changes incompatibly.
+-pub const SHMEM_VERSION: u32 = 3;
++/// header layout changes incompatibly. V4 introduces the per-CPU
++/// principal buffer carve (W1 in `docs/dtrace-roadmap.md`):
++/// the 6 MB ring is split into `SHMEM_NUM_CPUS_MAX` sub-rings of
++/// `per_cpu_ring_len` each, with one cache line of producer /
++/// consumer / drop state per CPU at offset 128.
++pub const SHMEM_VERSION: u32 = 4;
++/// Cap on per-CPU sub-rings. Hosts with more CPUs than the cap
++/// share a sub-ring (`smp_processor_id() % num_cpus` selection
++/// at reserve time). Cross-layer drift pinned in
++/// `third_party/linux-bifrost/drivers/bifrost/shmem_layout.rs`
++/// as `SHMEM_NUM_CPUS_MAX` and `BIFROST_NUM_CPUS_MAX` in
++/// `kernel/bpf/helpers.c`.
++pub const SHMEM_NUM_CPUS_MAX: u32 = 16;
++/// Byte offset of the per-CPU state array within the SHMEM
++/// header page. Each entry is one cache line.
++pub const SHMEM_PER_CPU_STATE_OFF: u32 = 128;
++/// Stride between successive CPU state entries (one cache line).
++pub const SHMEM_PER_CPU_STATE_STRIDE: u32 = 64;
+ /// 8-byte record header: u32 size, u32 flags.
+ pub const SHMEM_RECORD_HDR_SIZE: usize = 8;
+ pub const SHMEM_RECORD_FLAG_READY: u32 = 1;
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 867887a95b09..16a213470e87 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -2386,47 +2386,95 @@ EXPORT_SYMBOL_GPL(bifrost_free_shmem);
+  * must drain to advance consumer_pos. Wrap-aware reservation is a
+  * follow-on iteration.
+  */
++/* Per-CPU sub-ring state. Each CPU gets its own cache line at
++ * `header + per_cpu_state_off + cpu * 64`. Layout matches the
++ * host-side bifrost::cli::control_shmem::DataShmSnapshot
++ * per-CPU readback. The remaining 32 bytes after the 4 atomic64
++ * counters pad the struct to one cache line; future per-class
++ * drop counters (W7 follow-on) consume that headroom.
++ */
++struct bifrost_shmem_per_cpu {
++	atomic64_t producer_pos;
++	atomic64_t consumer_pos;
++	atomic64_t dropped_records;
++	atomic64_t dropped_bytes;
++	u8 _pad[32];
++} __aligned(64);
++
++/* SHMEM ringbuf header (SHMEM_VERSION 4 — per-CPU principal
++ * buffer). The 6 MB ringbuf area is carved into `num_cpus`
++ * equal-size sub-rings of length `per_cpu_ring_len` each,
++ * starting at `ringbuf_off + cpu * per_cpu_ring_len`. Producer
++ * (BPF program) picks its sub-ring via `smp_processor_id() %
++ * num_cpus`; consumer (host renderer) round-robins drain across
++ * all `num_cpus` sub-rings. Eliminates the cross-CPU CAS
++ * contention on a single `producer_pos` that was the practical
++ * throughput ceiling under hot workloads (compile-profile at
++ * FIRE_GAP=0.05 dropped 1.7M records / 16 s on the single-ring
++ * layout). */
++#define BIFROST_NUM_CPUS_MAX 16
++#define BIFROST_PER_CPU_STATE_OFF 128
++#define BIFROST_PER_CPU_STATE_STRIDE 64
++
+ struct bifrost_shmem_ringbuf_hdr {
+ 	u32 magic;
+ 	u32 version;
+ 	u64 region_len;
+ 	u64 ringbuf_off;
+ 	u64 ringbuf_len;
+-	atomic64_t producer_pos;
+-	atomic64_t consumer_pos;
+-	/* Phase 3a: BTF + kallsyms in-region. The bifrost guest
+-	 * module memcpys vmlinux BTF and walked kallsyms into these
+-	 * sub-regions before sending SHMEM_INIT. The host reads
+-	 * them out of SHMEM directly — replaces the legacy op=4
+-	 * SEND_BTF and op=5 SEND_KSYMS chunked-virtqueue protocols.
+-	 */
++	/* Phase 3a: BTF + kallsyms in-region. */
+ 	u64 btf_off;
+ 	u64 btf_len;
+ 	u64 ksyms_off;
+ 	u64 ksyms_len;
+-	/* Phase 3b reserved (per-(tgid,exec_id) VMA cache). */
++	/* Phase 3b: per-(tgid,exec_id) VMA cache. */
+ 	u64 vma_cache_off;
+ 	u64 vma_cache_len;
+-	atomic64_t dropped_records;
+-	atomic64_t dropped_bytes;
++	/* W1: per-CPU principal buffer */
++	u32 num_cpus;
++	u32 per_cpu_state_stride;
++	u64 per_cpu_ring_len;
++	u64 per_cpu_state_off;
++	u8 _pad[24];
++	/* per-CPU state starts here at offset 128, one cache line per
++	 * CPU. Accessed via the `bifrost_shmem_pcpu(hdr, cpu)` helper
++	 * below so future relayout doesn't change call sites. */
++	struct bifrost_shmem_per_cpu per_cpu[BIFROST_NUM_CPUS_MAX];
+ };
++static_assert(offsetof(struct bifrost_shmem_ringbuf_hdr, per_cpu) ==
++		      BIFROST_PER_CPU_STATE_OFF,
++	      "per_cpu state must land at offset 128");
++static_assert(sizeof(struct bifrost_shmem_per_cpu) ==
++		      BIFROST_PER_CPU_STATE_STRIDE,
++	      "per_cpu state must be one cache line");
+ 
+ #define BIFROST_RB_FLAG_READY     (1u << 0)
+ #define BIFROST_RB_FLAG_PADDING   (1u << 1)
+ #define BIFROST_RB_RECORD_HDR     8
+ /* Bumped from 8 KB to 64 KB to fit agg-snapshot records (worst-
+- * case ~41 KB at 2048 entries × 20 bytes). The SHMEM ringbuf is
+- * 6 MB so even a max-size record consumes < 2 % of the buffer. */
++ * case ~41 KB at 2048 entries × 20 bytes). With 16 per-CPU
++ * sub-rings carved from 6 MB total, each sub-ring is 384 KB —
++ * a max-size record consumes ~17 % of one sub-ring. */
+ #define BIFROST_RB_MAX_RECORD     65536
+ 
+ static char *bifrost_shmem_va __read_mostly;
+ static unsigned long bifrost_shmem_len __read_mostly;
+ 
++static inline struct bifrost_shmem_per_cpu *
++bifrost_shmem_pcpu(struct bifrost_shmem_ringbuf_hdr *hdr, unsigned int cpu)
++{
++	if (cpu >= hdr->num_cpus)
++		cpu = 0;
++	return &hdr->per_cpu[cpu];
++}
++
+ static void bifrost_shmem_note_drop(struct bifrost_shmem_ringbuf_hdr *hdr,
+-				    u32 size)
++				    unsigned int cpu, u32 size)
+ {
+-	atomic64_inc(&hdr->dropped_records);
+-	atomic64_add(size, &hdr->dropped_bytes);
++	struct bifrost_shmem_per_cpu *pc = bifrost_shmem_pcpu(hdr, cpu);
++
++	atomic64_inc(&pc->dropped_records);
++	atomic64_add(size, &pc->dropped_bytes);
+ }
+ 
+ /*
+@@ -2444,13 +2492,13 @@ int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
+ 			      unsigned long vma_cache_len)
+ {
+ 	struct bifrost_shmem_ringbuf_hdr *hdr;
++	unsigned int num_cpus, cpu;
++	u64 per_cpu_ring_len;
+ 
+ 	if (!shmem_va || region_len < ringbuf_off + ringbuf_len)
+ 		return -EINVAL;
+ 	if (ringbuf_len & 7)
+ 		return -EINVAL;
+-	/* Sub-region bounds checks (zero len is OK — means region
+-	 * not yet populated; host treats it as absent). */
+ 	if (btf_len && btf_off + btf_len > region_len)
+ 		return -EINVAL;
+ 	if (ksyms_len && ksyms_off + ksyms_len > region_len)
+@@ -2458,6 +2506,22 @@ int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
+ 	if (vma_cache_len && vma_cache_off + vma_cache_len > region_len)
+ 		return -EINVAL;
+ 
++	/* Pick the number of per-CPU sub-rings: min(possible CPUs,
++	 * BIFROST_NUM_CPUS_MAX). The kfunc selects via
++	 * `smp_processor_id() % num_cpus`, so on hosts with more CPUs
++	 * than NUM_CPUS_MAX multiple CPUs share a sub-ring (still
++	 * better than the single-ring layout). 8-byte-align the
++	 * per-CPU length so each sub-ring's producer/consumer math
++	 * stays on the existing alignment guarantees. */
++	num_cpus = num_possible_cpus();
++	if (num_cpus == 0)
++		num_cpus = 1;
++	if (num_cpus > BIFROST_NUM_CPUS_MAX)
++		num_cpus = BIFROST_NUM_CPUS_MAX;
++	per_cpu_ring_len = (ringbuf_len / num_cpus) & ~7ULL;
++	if (per_cpu_ring_len < 4096)
++		return -EINVAL;
++
+ 	hdr = (struct bifrost_shmem_ringbuf_hdr *)shmem_va;
+ 	hdr->region_len = region_len;
+ 	hdr->ringbuf_off = ringbuf_off;
+@@ -2468,10 +2532,19 @@ int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
+ 	hdr->ksyms_len = ksyms_len;
+ 	hdr->vma_cache_off = vma_cache_off;
+ 	hdr->vma_cache_len = vma_cache_len;
+-	atomic64_set(&hdr->producer_pos, 0);
+-	atomic64_set(&hdr->consumer_pos, 0);
+-	atomic64_set(&hdr->dropped_records, 0);
+-	atomic64_set(&hdr->dropped_bytes, 0);
++	hdr->num_cpus = num_cpus;
++	hdr->per_cpu_state_stride = BIFROST_PER_CPU_STATE_STRIDE;
++	hdr->per_cpu_ring_len = per_cpu_ring_len;
++	hdr->per_cpu_state_off = BIFROST_PER_CPU_STATE_OFF;
++
++	for (cpu = 0; cpu < BIFROST_NUM_CPUS_MAX; cpu++) {
++		struct bifrost_shmem_per_cpu *pc = &hdr->per_cpu[cpu];
++
++		atomic64_set(&pc->producer_pos, 0);
++		atomic64_set(&pc->consumer_pos, 0);
++		atomic64_set(&pc->dropped_records, 0);
++		atomic64_set(&pc->dropped_bytes, 0);
++	}
+ 	smp_wmb();
+ 
+ 	WRITE_ONCE(bifrost_shmem_va, (char *)shmem_va);
+@@ -3765,51 +3838,58 @@ void *bifrost_shmem_reserve_kernel(u32 size)
+ {
+ 	char *base = READ_ONCE(bifrost_shmem_va);
+ 	struct bifrost_shmem_ringbuf_hdr *hdr;
++	struct bifrost_shmem_per_cpu *pc;
+ 	u64 aligned, cur, new_pos, cons;
+ 	u64 rb_off, rb_len, off_in_rb;
++	u64 per_cpu_len;
+ 	u32 *rec_hdr;
+ 	char *data;
++	unsigned int cpu;
+ 
+ 	if (!base || !size || size > BIFROST_RB_MAX_RECORD)
+ 		return NULL;
+ 	hdr = (struct bifrost_shmem_ringbuf_hdr *)base;
+ 	rb_off = hdr->ringbuf_off;
+ 	rb_len = hdr->ringbuf_len;
+-	if (!rb_len)
++	per_cpu_len = hdr->per_cpu_ring_len;
++	if (!rb_len || !per_cpu_len || !hdr->num_cpus)
+ 		return NULL;
+-	data = base + rb_off;
++
++	/* W1: per-CPU sub-ring selection. Pin to the current CPU's
++	 * sub-ring (modulo num_cpus on hosts with more CPUs than
++	 * BIFROST_NUM_CPUS_MAX). No preemption disable needed —
++	 * smp_processor_id() under preempt-able BPF context can
++	 * migrate, but a migration after picking the sub-ring just
++	 * means we CAS into the previous CPU's ring; correctness is
++	 * preserved by the atomic CAS, only fairness is slightly
++	 * reduced. The kernel BPF prologue typically pins anyway. */
++	cpu = smp_processor_id() % hdr->num_cpus;
++	pc = &hdr->per_cpu[cpu];
++	data = base + rb_off + (u64)cpu * per_cpu_len;
+ 
+ 	aligned = ALIGN(BIFROST_RB_RECORD_HDR + size, 8);
+ 
+ 	for (;;) {
+-		cur = atomic64_read(&hdr->producer_pos);
+-		cons = atomic64_read(&hdr->consumer_pos);
+-		off_in_rb = cur % rb_len;
+-
+-		/* Wraparound: when the record would cross the end-of-
+-		 * buffer, atomically claim the remaining bytes as a
+-		 * padding record. The consumer recognizes
+-		 * BIFROST_RB_FLAG_PADDING and skips the full claimed
+-		 * length. After the claim succeeds, loop again to
+-		 * claim the real record at offset 0.
+-		 *
+-		 * pad_size is guaranteed 8-aligned because both
+-		 * `cur` and `rb_len` are advanced/sized in 8-byte
+-		 * units. */
+-		if (off_in_rb + aligned > rb_len) {
+-			u64 pad_size = rb_len - off_in_rb;
+-			if (cur + pad_size - cons > rb_len) {
+-				bifrost_shmem_note_drop(hdr, size);
+-				return NULL; /* padding would lap consumer */
++		cur = atomic64_read(&pc->producer_pos);
++		cons = atomic64_read(&pc->consumer_pos);
++		off_in_rb = cur % per_cpu_len;
++
++		/* Wraparound within this CPU's sub-ring: claim a
++		 * padding record for the remaining bytes, then loop
++		 * to claim the real record at offset 0 of the same
++		 * sub-ring. */
++		if (off_in_rb + aligned > per_cpu_len) {
++			u64 pad_size = per_cpu_len - off_in_rb;
++			if (cur + pad_size - cons > per_cpu_len) {
++				bifrost_shmem_note_drop(hdr, cpu, size);
++				return NULL;
+ 			}
+ 			new_pos = cur + pad_size;
+-			if (atomic64_cmpxchg(&hdr->producer_pos, cur,
++			if (atomic64_cmpxchg(&pc->producer_pos, cur,
+ 					     new_pos) != cur) {
+ 				cpu_relax();
+ 				continue;
+ 			}
+-			/* Stamp the padding header and publish atomically
+-			 * so the consumer can skip past us safely. */
+ 			rec_hdr = (u32 *)(data + off_in_rb);
+ 			rec_hdr[0] = pad_size - BIFROST_RB_RECORD_HDR;
+ 			smp_store_release(
+@@ -3818,12 +3898,12 @@ void *bifrost_shmem_reserve_kernel(u32 size)
+ 			continue;
+ 		}
+ 
+-		if (cur + aligned - cons > rb_len) {
+-			bifrost_shmem_note_drop(hdr, size);
++		if (cur + aligned - cons > per_cpu_len) {
++			bifrost_shmem_note_drop(hdr, cpu, size);
+ 			return NULL;
+ 		}
+ 		new_pos = cur + aligned;
+-		if (atomic64_cmpxchg(&hdr->producer_pos, cur, new_pos) == cur)
++		if (atomic64_cmpxchg(&pc->producer_pos, cur, new_pos) == cur)
+ 			break;
+ 		cpu_relax();
+ 	}
+@@ -4006,19 +4086,29 @@ __bpf_kfunc void bifrost_kfunc_shmem_kick(void)
+ {
+ 	char *base = READ_ONCE(bifrost_shmem_va);
+ 	struct bifrost_shmem_ringbuf_hdr *hdr;
++	struct bifrost_shmem_per_cpu *pc;
+ 	bifrost_kick_fn_t fn;
+ 	u64 prod, cons;
++	unsigned int cpu;
+ 
+ 	fn = READ_ONCE(bifrost_kick_fn);
+ 	if (!fn || !base)
+ 		return;
+ 	hdr = (struct bifrost_shmem_ringbuf_hdr *)base;
+-	prod = atomic64_read(&hdr->producer_pos);
+-	cons = atomic64_read(&hdr->consumer_pos);
+-	/* Only fire when the consumer has fallen meaningfully behind.
+-	 * False negatives (consumer asleep but distance < threshold)
+-	 * are bounded — the consumer's 1 ms poll-timeout fallback
+-	 * picks them up. Eliminates per-fire MMIO trap cost. */
++	if (!hdr->num_cpus)
++		return;
++	/* W1: only kick when *this CPU's* sub-ring has fallen
++	 * meaningfully behind. False negatives (this CPU's consumer
++	 * asleep but distance < threshold) are bounded — the
++	 * consumer's per-CPU drain loop picks them up on its next
++	 * poll cycle. The single-ring layout's threshold (4 KB)
++	 * mapped to ~6-8 typical records on a 6 MB ring; on a
++	 * per-CPU sub-ring of ~384 KB that's still the right
++	 * order-of-magnitude wake threshold. */
++	cpu = smp_processor_id() % hdr->num_cpus;
++	pc = &hdr->per_cpu[cpu];
++	prod = atomic64_read(&pc->producer_pos);
++	cons = atomic64_read(&pc->consumer_pos);
+ 	if (prod - cons < BIFROST_DOORBELL_THRESHOLD_BYTES)
+ 		return;
+ 	fn(READ_ONCE(bifrost_kick_priv));
+-- 
+2.50.1 (Apple Git-155)
+

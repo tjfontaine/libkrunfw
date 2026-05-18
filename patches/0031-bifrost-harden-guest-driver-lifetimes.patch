@@ -1,0 +1,1220 @@
+From ba0166ad8caab2dbf96b114059a0c0e0f754985f Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Mon, 11 May 2026 18:52:35 -0700
+Subject: [PATCH] bifrost: harden guest driver lifetimes
+
+---
+ drivers/bifrost/bifrost.rs        | 486 +++++++++++++++++++++---------
+ drivers/bifrost/bifrost_helpers.c |  60 ++--
+ drivers/bifrost/task_helpers.rs   |  31 +-
+ kernel/bpf/helpers.c              |  16 +
+ 4 files changed, 412 insertions(+), 181 deletions(-)
+
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index ebfe81c7413a..f10fdd14cb9c 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -80,7 +80,7 @@
+ use path_helpers::path_basename;
+ use record_writer::RecordWriter;
+ use shmem_publish::{populate_shmem_btf, populate_shmem_kallsyms};
+-use task_helpers::find_task_by_comm;
++use task_helpers::{find_task_by_comm, put_task_ref};
+ use types::{BifrostCmd, BpfInsn, MapDef};
+ use shmem_layout::{
+     SHMEM_BTF_CAP, SHMEM_BTF_OFF, SHMEM_HDR_LEN, SHMEM_HDR_OFF, SHMEM_KSYMS_CAP, SHMEM_KSYMS_OFF,
+@@ -478,6 +478,13 @@ fn slot_lease_new() -> u64 {
+ /// once layer-2 demos pass.
+ pub static BIFROST_USE_VERIFIER: AtomicBool = AtomicBool::new(true);
+ 
++/// The current helper surface is intentionally singleton: SHMEM
++/// reserve/submit and the doorbell kfunc are published through global
++/// kernel/bpf helper state. Reject a second virtio-bifrost device
++/// rather than sharing slots, map fake-fd caches, and callback private
++/// data across devices.
++static BIFROST_DEVICE_LIVE: AtomicBool = AtomicBool::new(false);
++
+ // Phase K — kfunc manifest expected on the C side.  Each entry is
+ // (name, canonical_signature_string).  bifrost_helpers.c carries the
+ // identical list as `BIFROST_KFUNC_MANIFEST`; module init validates
+@@ -499,6 +506,10 @@ struct KfuncDecl {
+         name: b"bifrost_helper_find_task_by_comm",
+         sig: b"struct task_struct *(const unsigned char *, unsigned int)",
+     },
++    KfuncDecl {
++        name: b"bifrost_helper_put_task_struct",
++        sig: b"void (struct task_struct *)",
++    },
+     KfuncDecl {
+         name: b"bifrost_helper_resolve_symbol",
+         sig: b"int (struct file *, const u8 *, u32, u64 *, u64 *)",
+@@ -563,6 +574,12 @@ const fn bifrost_kfunc_expected_hash() -> u32 {
+     /// surfaces independently of the hash so the diagnostic names
+     /// the specific failure mode.
+     fn bifrost_kfunc_manifest_len() -> u32;
++    /// Clear global SHMEM ringbuf state before the Bifrost device frees
++    /// or unmaps the backing region.
++    fn bifrost_clear_shmem_ringbuf();
++    /// Clear the global doorbell kfunc callback before the Bifrost
++    /// device frees its virtqueues or private state.
++    fn bifrost_clear_doorbell_callback();
+     // BPF prog management
+     fn bpf_prog_alloc(size: u32, gfp_extra_flags: bindings::gfp_t) -> *mut bindings::bpf_prog;
+     fn bpf_prog_select_runtime(fp: *mut bindings::bpf_prog, err: *mut c_int) -> *mut bindings::bpf_prog;
+@@ -1131,6 +1148,213 @@ unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
+ }
+ 
+ 
++unsafe fn repost_ctrl_status(bg: *mut BifrostGuest, status: i32) {
++    unsafe {
++        core::ptr::copy_nonoverlapping(
++            &status as *const i32 as *const u8,
++            (*bg).ctrl_buf as *mut u8,
++            4,
++        );
++
++        let mut sg_in: bindings::scatterlist = core::mem::zeroed();
++        bindings::sg_init_one(&mut sg_in, (*bg).ctrl_buf, 65536);
++        bindings::virtqueue_add_inbuf(
++            (*bg).vq_ctrl,
++            &mut sg_in,
++            1,
++            (*bg).ctrl_buf,
++            bindings::GFP_KERNEL,
++        );
++        bindings::virtqueue_kick((*bg).vq_ctrl);
++    }
++}
++
++unsafe fn free_slot_prog(slot: usize) {
++    unsafe {
++        if slot >= slots_mut().len() {
++            return;
++        }
++        let prog = slots_mut()[slot].prog.swap(core::ptr::null_mut(), Ordering::AcqRel);
++        if !prog.is_null() {
++            bpf_prog_free(prog);
++        }
++    }
++}
++
++unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32) -> c_int {
++    unsafe {
++        const CMD_HDR: usize = core::mem::size_of::<BifrostCmd>();
++        const FIXED: usize = 4 + 32 + 4;
++        const MAP_DEF_SIZE: usize = core::mem::size_of::<MapDef>();
++        const INSN_SIZE: usize = core::mem::size_of::<BpfInsn>();
++
++        if cmd.is_null() || (cmd_len as usize) < CMD_HDR {
++            return -(bindings::EINVAL as i32);
++        }
++        let declared = (*cmd).len as usize;
++        let avail = (cmd_len as usize).saturating_sub(CMD_HDR);
++        if declared > avail || declared < FIXED {
++            pr_err!(
++                "bifrost_guest: LOAD_PROG invalid length declared={} avail={}\n",
++                declared, avail
++            );
++            return -(bindings::EINVAL as i32);
++        }
++
++        let base = (cmd as *const u8).add(CMD_HDR);
++        let mut off = 0usize;
++        let limit = declared;
++
++        let need = |off: usize, n: usize, limit: usize| -> bool {
++            off.checked_add(n).map_or(false, |end| end <= limit)
++        };
++        if !need(off, 4, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        let num_maps = *(base.add(off) as *const u32) as usize;
++        off += 4 + 32;
++        if !need(off, 4, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        let flags = *(base.add(off) as *const u32);
++        off += 4;
++        let probe_type = (flags & 0xff) as u8;
++
++        match probe_type {
++            PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => {
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let path_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if path_len > 256 || !need(off, path_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += path_len;
++                if !need(off, 8, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += 8;
++            }
++            PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => {
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let bn_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if bn_len == 0 || bn_len > 64 || !need(off, bn_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += bn_len;
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let sym_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if sym_len == 0 || sym_len > 256 || !need(off, sym_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += sym_len;
++            }
++            PROBE_TYPE_USDT => {
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let bn_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if bn_len == 0 || bn_len > 64 || !need(off, bn_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += bn_len;
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let prov_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if prov_len == 0 || prov_len > 64 || !need(off, prov_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += prov_len;
++                if !need(off, 4, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                let probe_len = *(base.add(off) as *const u32) as usize;
++                off += 4;
++                if probe_len == 0 || probe_len > 256 || !need(off, probe_len, limit) {
++                    return -(bindings::EINVAL as i32);
++                }
++                off += probe_len;
++            }
++            _ => {}
++        }
++
++        if num_maps > 8 {
++            pr_err!("bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap 8\n", num_maps);
++            return -(bindings::EINVAL as i32);
++        }
++        let map_bytes = match num_maps.checked_mul(MAP_DEF_SIZE) {
++            Some(v) => v,
++            None => return -(bindings::EINVAL as i32),
++        };
++        if !need(off, map_bytes, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        off += map_bytes;
++
++        if !need(off, 4, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        let num_insns = *(base.add(off) as *const u32) as usize;
++        off += 4;
++        let insn_bytes = match num_insns.checked_mul(INSN_SIZE) {
++            Some(v) => v,
++            None => return -(bindings::EINVAL as i32),
++        };
++        if !need(off, insn_bytes, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++
++        let insns = base.add(off) as *const BpfInsn;
++        let mut idx = 0usize;
++        while idx < num_insns {
++            let insn = &*insns.add(idx);
++            if insn.code == BPF_LD_IMM64 && insn.src_reg() == BPF_PSEUDO_MAP_FD {
++                if idx + 1 >= num_insns {
++                    pr_err!("bifrost_guest: LOAD_PROG ldimm64 at final insn {}\n", idx);
++                    return -(bindings::EINVAL as i32);
++                }
++                idx += 2;
++            } else {
++                idx += 1;
++            }
++        }
++        off += insn_bytes;
++
++        if !need(off, 4, limit) {
++            return -(bindings::EINVAL as i32);
++        }
++        let num_relocs = *(base.add(off) as *const u32) as usize;
++        off += 4;
++        for _ in 0..num_relocs {
++            if !need(off, 5, limit) {
++                return -(bindings::EINVAL as i32);
++            }
++            let insn_idx = *(base.add(off) as *const u32) as usize;
++            off += 4;
++            let name_len = *base.add(off) as usize;
++            off += 1;
++            if name_len == 0 || name_len >= 256 || !need(off, name_len, limit) {
++                return -(bindings::EINVAL as i32);
++            }
++            if insn_idx >= num_insns {
++                return -(bindings::EINVAL as i32);
++            }
++            off += name_len;
++        }
++        0
++    }
++}
++
+ 
+ 
+ /// One-shot SHMEM_INIT message to the host. For the generic virtio
+@@ -1319,8 +1543,18 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+ 
+                 let cmd = (*bg).ctrl_buf as *mut BifrostCmd;
+                 if (*bg).cmd_len >= core::mem::size_of::<BifrostCmd>() as u32 {
++                    let mut load_status: i32 = 0;
+                     if (*cmd).op == 2 { // LOAD_PROG
+                         pr_info!("bifrost_guest: processing LOAD_PROG command\n");
++                        let parse_status = validate_load_prog_cmd(cmd, (*bg).cmd_len);
++                        if parse_status != 0 {
++                            pr_err!(
++                                "bifrost_guest: LOAD_PROG rejected by bounded parser: {}\n",
++                                parse_status
++                            );
++                            repost_ctrl_status(bg, parse_status);
++                            continue;
++                        }
+                         
+                         // LOAD_PROG payload layout:
+                         //   [0..4]   op: u32 = 2
+@@ -1511,27 +1745,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                             // Skip processing this command; re-post and
+                             // continue.  Falling through with bad lengths
+                             // would corrupt the maps/insns offsets.
+-                            let status: i32 = -22; // -EINVAL
+-                            core::ptr::copy_nonoverlapping(
+-                                &status as *const i32 as *const u8,
+-                                (*bg).ctrl_buf as *mut u8,
+-                                4,
+-                            );
+-                            let mut sg_in: bindings::scatterlist =
+-                                core::mem::zeroed();
+-                            bindings::sg_init_one(
+-                                &mut sg_in,
+-                                (*bg).ctrl_buf,
+-                                65536,
+-                            );
+-                            bindings::virtqueue_add_inbuf(
+-                                (*bg).vq_ctrl,
+-                                &mut sg_in,
+-                                1,
+-                                (*bg).ctrl_buf,
+-                                bindings::GFP_KERNEL,
+-                            );
+-                            bindings::virtqueue_kick((*bg).vq_ctrl);
++                            repost_ctrl_status(bg, -(bindings::EINVAL as i32));
+                             continue;
+                         }
+ 
+@@ -1599,6 +1813,9 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+ 
+                             if map_ptr.is_null() {
+                                 pr_err!("bifrost_guest: failed to allocate bpf_map\n");
++                                if load_status == 0 {
++                                    load_status = -(bindings::ENOMEM as i32);
++                                }
+                                 continue;
+                             }
+ 
+@@ -1612,11 +1829,15 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                             (*bg).num_maps = (new_slot + 1) as u32;
+ 
+                             // LAYER 2 fd allocation moved to a second pass
+-                            // below — see "Phase 1b". Both newly-allocated and
+-                            // dedup-reused maps need a fresh real fd for the
+-                            // verifier of THIS program (we close them after).
++	                            // below — see "Phase 1b". Both newly-allocated and
++	                            // dedup-reused maps need a fresh real fd for the
++	                            // verifier of THIS program (we close them after).
++	                        }
++                        if load_status != 0 {
++                            repost_ctrl_status(bg, load_status);
++                            continue;
+                         }
+-                        // --- Phase 1b: per-program real-fd allocation. ---
++	                        // --- Phase 1b: per-program real-fd allocation. ---
+                         // Layer 2 only. Walk the MapDef array (not just newly-
+                         // allocated maps), look up the slot for each fake_fd,
+                         // and bind a fresh real fd via bifrost_map_get_fd.
+@@ -1856,22 +2077,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                     BIFROST_MAP_REAL_FDS[j] = -1;
+                                 }
+                             }
+-                            let status: i32 = -22; // -EINVAL
+-                            core::ptr::copy_nonoverlapping(
+-                                &status as *const i32 as *const u8,
+-                                (*bg).ctrl_buf as *mut u8,
+-                                4,
+-                            );
+-                            let mut sg_in: bindings::scatterlist = core::mem::zeroed();
+-                            bindings::sg_init_one(&mut sg_in, (*bg).ctrl_buf, 65536);
+-                            bindings::virtqueue_add_inbuf(
+-                                (*bg).vq_ctrl,
+-                                &mut sg_in,
+-                                1,
+-                                (*bg).ctrl_buf,
+-                                bindings::GFP_KERNEL,
+-                            );
+-                            bindings::virtqueue_kick((*bg).vq_ctrl);
++                            repost_ctrl_status(bg, -(bindings::EINVAL as i32));
+                             continue;
+                         }
+                         if num_relocs > 0 {
+@@ -1898,22 +2104,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                 e
+                             );
+                             // Re-arm and continue without registering anything.
+-                            let status: i32 = -1;
+-                            core::ptr::copy_nonoverlapping(
+-                                &status as *const i32 as *const u8,
+-                                (*bg).ctrl_buf as *mut u8,
+-                                4,
+-                            );
+-                            let mut sg_in: bindings::scatterlist = core::mem::zeroed();
+-                            bindings::sg_init_one(&mut sg_in, (*bg).ctrl_buf, 65536);
+-                            bindings::virtqueue_add_inbuf(
+-                                (*bg).vq_ctrl,
+-                                &mut sg_in,
+-                                1,
+-                                (*bg).ctrl_buf,
+-                                bindings::GFP_KERNEL,
+-                            );
+-                            bindings::virtqueue_kick((*bg).vq_ctrl);
++                            repost_ctrl_status(bg, -(bindings::ENOMEM as i32));
+                             continue;
+                         }
+ 
+@@ -2055,6 +2246,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                             BIFROST_MAP_REAL_FDS[j] = -1;
+                                         }
+                                     }
++                                    repost_ctrl_status(bg, verr);
+                                     continue;
+                                 }
+                                 pr_info!("bifrost_guest: bifrost_verify_prog ok\n");
+@@ -2085,10 +2277,20 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                 prog_ok = true;
+                             } else {
+                                 pr_err!("bifrost_guest: BPF JIT failed: err={}\n", jit_err);
++                                if load_status == 0 {
++                                    load_status = if jit_err != 0 {
++                                        jit_err
++                                    } else {
++                                        -(bindings::EINVAL as i32)
++                                    };
++                                }
+                                 bpf_prog_free(prog_p);
+                             }
+                         } else {
+                             pr_err!("bifrost_guest: bpf_prog_alloc failed\n");
++                            if load_status == 0 {
++                                load_status = -(bindings::ENOMEM as i32);
++                            }
+                         }
+                         
+                         // (Legacy ringbuf-PFN-share + worker drain are
+@@ -2127,29 +2329,16 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                 uprobe_path_buf: &uprobe_path_buf,
+                                 uprobe_file_offset,
+                             };
+-                            slot_family_attach(slot, probe_type, bg, &ext);
++                            let attach_status = slot_family_attach(slot, probe_type, bg, &ext);
++                            if attach_status != 0 {
++                                load_status = attach_status;
++                            }
+                         }
+                     }
+                 }
+ 
+                 // Re-post ctrl buffer for next command
+-                let status: i32 = 0; // Success
+-                core::ptr::copy_nonoverlapping(
+-                    &status as *const i32 as *const u8,
+-                    (*bg).ctrl_buf as *mut u8,
+-                    4,
+-                );
+-
+-                let mut sg_in: bindings::scatterlist = core::mem::zeroed();
+-                bindings::sg_init_one(&mut sg_in, (*bg).ctrl_buf, 65536);
+-                bindings::virtqueue_add_inbuf(
+-                    (*bg).vq_ctrl,
+-                    &mut sg_in,
+-                    1,
+-                    (*bg).ctrl_buf,
+-                    bindings::GFP_KERNEL,
+-                );
+-                bindings::virtqueue_kick((*bg).vq_ctrl);
++                repost_ctrl_status(bg, load_status);
+             } else {
+                 bindings::schedule_timeout_interruptible(10);
+             }
+@@ -2231,8 +2420,17 @@ extern "C" fn vq_doorbell_cb(_vq: *mut bindings::virtqueue) {
+ 
+ extern "C" fn bifrost_probe(vdev: *mut bindings::virtio_device) -> c_int {
+     unsafe {
++        if BIFROST_DEVICE_LIVE
++            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
++            .is_err()
++        {
++            pr_err!("bifrost_guest: refusing second virtio device; helper state is singleton\n");
++            return -(bindings::EBUSY as i32);
++        }
++
+         let bg = bindings::__kmalloc_noprof(core::mem::size_of::<BifrostGuest>(), bindings::GFP_KERNEL) as *mut BifrostGuest;
+         if bg.is_null() {
++            BIFROST_DEVICE_LIVE.store(false, Ordering::Release);
+             return -(bindings::ENOMEM as i32);
+         }
+ 
+@@ -2275,6 +2473,7 @@ extern "C" fn bifrost_probe(vdev: *mut bindings::virtio_device) -> c_int {
+ 
+         if err != 0 {
+             bindings::kfree(bg as *const c_void);
++            BIFROST_DEVICE_LIVE.store(false, Ordering::Release);
+             return err;
+         }
+ 
+@@ -2296,6 +2495,7 @@ extern "C" fn bifrost_probe(vdev: *mut bindings::virtio_device) -> c_int {
+                 del_vqs(vdev);
+             }
+             bindings::kfree(bg as *const c_void);
++            BIFROST_DEVICE_LIVE.store(false, Ordering::Release);
+             return -(bindings::ENOMEM as i32);
+         }
+ 
+@@ -2328,6 +2528,7 @@ extern "C" fn bifrost_probe(vdev: *mut bindings::virtio_device) -> c_int {
+                     del_vqs(vdev);
+                 }
+                 bindings::kfree(bg as *const c_void);
++                BIFROST_DEVICE_LIVE.store(false, Ordering::Release);
+                 return -(bindings::ENOMEM as i32);
+             }
+             shmem_va = bindings::bifrost_alloc_shmem(
+@@ -2349,6 +2550,7 @@ extern "C" fn bifrost_probe(vdev: *mut bindings::virtio_device) -> c_int {
+                     del_vqs(vdev);
+                 }
+                 bindings::kfree(bg as *const c_void);
++                BIFROST_DEVICE_LIVE.store(false, Ordering::Release);
+                 return -(bindings::ENOMEM as i32);
+             }
+         }
+@@ -2507,16 +2709,15 @@ struct AttachExt<'a> {
+ /// cleanup path tolerates `lease == 0` for slots that never got
+ /// attached.
+ ///
+-/// Returns nothing — failures are reported via `pr_err!` from the
+-/// per-family functions, mirroring existing behavior.  Phase B's
+-/// emit-side feedback channel will hook into this dispatch in a
+-/// follow-up by also accumulating a per-program status code.
++/// Returns 0 on success or a negative errno from the per-family attach.
++/// On failure, the JIT'd program stored in the slot is released and the
++/// lease is cleared so the worker can report truthful LOAD_PROG status.
+ unsafe fn slot_family_attach(
+     slot: usize,
+     probe_type: u8,
+     bg: *mut BifrostGuest,
+     ext: &AttachExt<'_>,
+-) {
++) -> c_int {
+     unsafe {
+         // Heap-migration: grow the slot table here so the
+         // family-specific attach below can index slot N safely.
+@@ -2525,15 +2726,15 @@ unsafe fn slot_family_attach(
+         // covers any future caller path.
+         if slots_ensure(slot + 1).is_err() {
+             pr_err!("bifrost_guest: slot table grow to len={} failed in slot_family_attach\n", slot + 1);
+-            return;
++            return -(bindings::ENOMEM as i32);
+         }
+         slots_mut()[slot].lease = slot_lease_new();
+-        match probe_type {
++        let rc = match probe_type {
+             PROBE_TYPE_FENTRY | PROBE_TYPE_FEXIT => {
+-                attach_slot_fbt(slot, probe_type, ext.name_str, bg);
++                attach_slot_fbt(slot, probe_type, ext.name_str, bg)
+             }
+             PROBE_TYPE_TRACEPOINT => {
+-                attach_slot_tracepoint(slot, ext.name_str, bg);
++                attach_slot_tracepoint(slot, ext.name_str, bg)
+             }
+             PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => {
+                 attach_slot_uprobe(
+@@ -2543,7 +2744,7 @@ unsafe fn slot_family_attach(
+                     ext.uprobe_path_buf,
+                     ext.uprobe_file_offset,
+                     bg,
+-                );
++                )
+             }
+             PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => {
+                 attach_slot_uprobe_by_sym(
+@@ -2552,7 +2753,7 @@ unsafe fn slot_family_attach(
+                     ext.uprobe_basename,
+                     ext.uprobe_symbol,
+                     bg,
+-                );
++                )
+             }
+             PROBE_TYPE_USDT => {
+                 attach_slot_usdt(
+@@ -2561,7 +2762,7 @@ unsafe fn slot_family_attach(
+                     ext.uprobe_provider,
+                     ext.uprobe_symbol,
+                     bg,
+-                );
++                )
+             }
+             _ => {
+                 pr_err!(
+@@ -2570,13 +2771,14 @@ unsafe fn slot_family_attach(
+                     ext.name_str,
+                     slot
+                 );
+-                let leaked = slots_mut()[slot].prog.swap(core::ptr::null_mut(), Ordering::AcqRel);
+-                if !leaked.is_null() {
+-                    bpf_prog_free(leaked);
+-                }
+-                slots_mut()[slot].lease = 0;
++                -(bindings::EINVAL as i32)
+             }
++        };
++        if rc != 0 {
++            free_slot_prog(slot);
++            slots_mut()[slot].lease = 0;
+         }
++        rc
+     }
+ }
+ 
+@@ -2643,7 +2845,7 @@ unsafe fn attach_slot_fbt(
+     probe_type: u8,
+     name_str: &str,
+     bg: *mut BifrostGuest,
+-) {
++) -> c_int {
+     unsafe {
+     let kind = if probe_type == PROBE_TYPE_FENTRY {
+         "fentry"
+@@ -2666,18 +2868,14 @@ unsafe fn attach_slot_fbt(
+             "bifrost_guest: {} slot[{}] target='{}': dst_trampoline missing — verifier didn't resolve attach target (BTF lookup failed?)\n",
+             kind, slot, name_str
+         );
+-        let leaked = slots_mut()[slot].prog.swap(core::ptr::null_mut(), Ordering::AcqRel);
+-        if !leaked.is_null() {
+-            bpf_prog_free(leaked);
+-        }
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     let link_p: *mut bindings::bpf_tracing_link = if (slot as usize) < slots_mut().len() {
+         slots_mut()[slot as usize].fbt_link.as_mut_ptr()
+     } else { core::ptr::null_mut() };
+     if link_p.is_null() {
+         pr_err!("bifrost_guest: {} slot[{}] OOB\n", kind, slot);
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     core::ptr::write_bytes(link_p, 0, 1);
+     // bpf_link_init takes a const ops ptr.  We pass our static
+@@ -2717,11 +2915,9 @@ unsafe fn attach_slot_fbt(
+             "bifrost_guest: {} slot[{}] bpf_trampoline_link_prog failed: {}\n",
+             kind, slot, lret
+         );
+-        let leaked = slots_mut()[slot].prog.swap(core::ptr::null_mut(), Ordering::AcqRel);
+-        if !leaked.is_null() {
+-            bpf_prog_free(leaked);
+-        }
++        return lret;
+     }
++    0
+     }
+ }
+ 
+@@ -2736,7 +2932,7 @@ unsafe fn attach_slot_fbt(
+ /// On any error the JIT'd prog is freed and any acquired btp
+ /// reference is dropped (`bpf_put_raw_tracepoint`) before
+ /// returning.  Symmetric to cleanup_slot_tracepoint.
+-unsafe fn attach_slot_tracepoint(slot: usize, name_str: &str, bg: *mut BifrostGuest) {
++unsafe fn attach_slot_tracepoint(slot: usize, name_str: &str, bg: *mut BifrostGuest) -> c_int {
+     unsafe {
+     let jitted = slots_mut()[slot].prog.load(Ordering::Acquire);
+     if jitted.is_null() {
+@@ -2744,7 +2940,7 @@ unsafe fn attach_slot_tracepoint(slot: usize, name_str: &str, bg: *mut BifrostGu
+             "bifrost_guest: tracepoint slot[{}]: prog NULL after JIT\n",
+             slot
+         );
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     let btp = bpf_get_raw_tracepoint(slots_mut()[slot].target_name.as_ptr() as *const _);
+     if btp.is_null() {
+@@ -2752,11 +2948,7 @@ unsafe fn attach_slot_tracepoint(slot: usize, name_str: &str, bg: *mut BifrostGu
+             "bifrost_guest: tracepoint slot[{}] event '{}' not found in kernel tracepoint table\n",
+             slot, name_str
+         );
+-        let leaked = slots_mut()[slot].prog.swap(core::ptr::null_mut(), Ordering::AcqRel);
+-        if !leaked.is_null() {
+-            bpf_prog_free(leaked);
+-        }
+-        return;
++        return -(bindings::ENOENT as i32);
+     }
+     let link_p: *mut bindings::bpf_raw_tp_link = if (slot as usize) < slots_mut().len() {
+         slots_mut()[slot as usize].rawtp_link.as_mut_ptr()
+@@ -2764,7 +2956,7 @@ unsafe fn attach_slot_tracepoint(slot: usize, name_str: &str, bg: *mut BifrostGu
+     if link_p.is_null() {
+         pr_err!("bifrost_guest: tracepoint slot[{}] OOB\n", slot);
+         bpf_put_raw_tracepoint(btp);
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     core::ptr::write_bytes(link_p, 0, 1);
+     // bpf_link_init: same all-None ops table as the tracing-link
+@@ -2793,11 +2985,9 @@ unsafe fn attach_slot_tracepoint(slot: usize, name_str: &str, bg: *mut BifrostGu
+             slot, lret
+         );
+         bpf_put_raw_tracepoint(btp);
+-        let leaked = slots_mut()[slot].prog.swap(core::ptr::null_mut(), Ordering::AcqRel);
+-        if !leaked.is_null() {
+-            bpf_prog_free(leaked);
+-        }
++        return lret;
+     }
++    0
+     }
+ }
+ 
+@@ -2820,7 +3010,7 @@ unsafe fn attach_slot_uprobe_by_sym(
+     basename: &[u8],
+     symbol: &[u8],
+     bg: *mut BifrostGuest,
+-) {
++) -> c_int {
+     unsafe {
+     // Defense in depth: caller (slot_family_attach via the
+     // LOAD_PROG dispatch) already called slots_ensure(slot+1).
+@@ -2828,7 +3018,7 @@ unsafe fn attach_slot_uprobe_by_sym(
+     // that forgets the grow step.
+     if slot >= slots_mut().len() {
+         pr_err!("bifrost_guest: uprobe slot[{}] out of range (len={})\n", slot, slots_mut().len());
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     // Initialize the wrapper's slot field, then expose the consumer
+     // pointer for the kernel uprobe API.  The kernel only sees the
+@@ -2841,7 +3031,7 @@ unsafe fn attach_slot_uprobe_by_sym(
+             "bifrost_guest: uprobe-by-sym slot[{}] consumer ptr null\n",
+             slot
+         );
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     let task = find_task_by_comm(basename);
+     if task.is_null() {
+@@ -2850,7 +3040,7 @@ unsafe fn attach_slot_uprobe_by_sym(
+             slot,
+             core::str::from_utf8(basename).unwrap_or("?")
+         );
+-        return;
++        return -(bindings::ENOENT as i32);
+     }
+     let exe = get_task_exe_file(task);
+     if exe.is_null() {
+@@ -2858,7 +3048,8 @@ unsafe fn attach_slot_uprobe_by_sym(
+             "bifrost_guest: uprobe-by-sym slot[{}] task has no exe_file\n",
+             slot
+         );
+-        return;
++        put_task_ref(task);
++        return -(bindings::ENOENT as i32);
+     }
+     let mut sym_off: u64 = 0;
+     let mut sym_size: u64 = 0;
+@@ -2877,7 +3068,8 @@ unsafe fn attach_slot_uprobe_by_sym(
+             rc
+         );
+         fput(exe);
+-        return;
++        put_task_ref(task);
++        return rc;
+     }
+     pr_info!(
+         "bifrost_guest: uprobe-by-sym slot[{}] resolved '{}'+0x{:x} (size={})\n",
+@@ -2900,6 +3092,7 @@ unsafe fn attach_slot_uprobe_by_sym(
+         Some(push_symtab_snapshot_cb),
+         core::ptr::null_mut(),
+     );
++    put_task_ref(task);
+     let exe_inode = (*exe).f_inode;
+     let pinned = igrab(exe_inode);
+     fput(exe);
+@@ -2908,7 +3101,7 @@ unsafe fn attach_slot_uprobe_by_sym(
+             "bifrost_guest: uprobe-by-sym slot[{}] igrab returned NULL\n",
+             slot
+         );
+-        return;
++        return -(bindings::ENOENT as i32);
+     }
+     // Reuse the same consumer-build + uprobe_register path used
+     // for host-resolved uprobes by dispatching on the *_BY_SYM
+@@ -2933,7 +3126,7 @@ unsafe fn attach_slot_uprobe_by_sym(
+             slot, raw
+         );
+         iput(pinned);
+-        return;
++        return if raw < 0 { raw as c_int } else { -(bindings::EINVAL as i32) };
+     }
+     slots_mut()[slot].uprobe_handle = handle;
+     slots_mut()[slot].uprobe_inode = pinned;
+@@ -2953,6 +3146,7 @@ unsafe fn attach_slot_uprobe_by_sym(
+         sym_off,
+         sym_size
+     );
++    0
+     }
+ }
+ 
+@@ -2976,7 +3170,7 @@ unsafe fn attach_slot_usdt(
+     sdt_provider: &[u8],
+     sdt_probe: &[u8],
+     bg: *mut BifrostGuest,
+-) {
++) -> c_int {
+     unsafe {
+     // Defense in depth: caller (slot_family_attach via the
+     // LOAD_PROG dispatch) already called slots_ensure(slot+1).
+@@ -2984,7 +3178,7 @@ unsafe fn attach_slot_usdt(
+     // that forgets the grow step.
+     if slot >= slots_mut().len() {
+         pr_err!("bifrost_guest: uprobe slot[{}] out of range (len={})\n", slot, slots_mut().len());
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     // Initialize the wrapper's slot field, then expose the consumer
+     // pointer for the kernel uprobe API.  The kernel only sees the
+@@ -2994,7 +3188,7 @@ unsafe fn attach_slot_usdt(
+     let consumer: *mut bindings::uprobe_consumer = &mut (*bp_ptr).consumer as *mut _;
+     if consumer.is_null() {
+         pr_err!("bifrost_guest: usdt slot[{}] consumer ptr null\n", slot);
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     let mut pc_off: u64 = 0;
+     let mut sema_off: u64 = 0;
+@@ -3007,7 +3201,7 @@ unsafe fn attach_slot_usdt(
+                 basename.len(),
+                 core::str::from_utf8(&basename[..256]).unwrap_or("?")
+             );
+-            return;
++            return -(bindings::EINVAL as i32);
+         }
+         let len = basename.len();
+         path_buf[..len].copy_from_slice(&basename[..len]);
+@@ -3024,7 +3218,7 @@ unsafe fn attach_slot_usdt(
+                 core::str::from_utf8(basename).unwrap_or("?"),
+                 raw_file
+             );
+-            return;
++            return if raw_file < 0 { raw_file as c_int } else { -(bindings::ENOENT as i32) };
+         }
+         let rc = bifrost_helper_resolve_usdt(
+             file,
+@@ -3045,7 +3239,7 @@ unsafe fn attach_slot_usdt(
+                 rc
+             );
+             fput(file);
+-            return;
++            return rc;
+         }
+         let pinned = igrab((*file).f_inode);
+         fput(file);
+@@ -3055,7 +3249,7 @@ unsafe fn attach_slot_usdt(
+                 slot,
+                 core::str::from_utf8(basename).unwrap_or("?")
+             );
+-            return;
++            return -(bindings::ENOENT as i32);
+         }
+         (core::ptr::null_mut(), pinned)
+     } else {
+@@ -3066,12 +3260,13 @@ unsafe fn attach_slot_usdt(
+                 slot,
+                 core::str::from_utf8(basename).unwrap_or("?")
+             );
+-            return;
++            return -(bindings::ENOENT as i32);
+         }
+         let exe = get_task_exe_file(task);
+         if exe.is_null() {
+             pr_err!("bifrost_guest: usdt slot[{}] task has no exe_file\n", slot);
+-            return;
++            put_task_ref(task);
++            return -(bindings::ENOENT as i32);
+         }
+         let rc = bifrost_helper_resolve_usdt(
+             exe,
+@@ -3091,7 +3286,8 @@ unsafe fn attach_slot_usdt(
+                 rc
+             );
+             fput(exe);
+-            return;
++            put_task_ref(task);
++            return rc;
+         }
+         let exe_inode = (*exe).f_inode;
+         let pinned = igrab(exe_inode);
+@@ -3113,10 +3309,11 @@ unsafe fn attach_slot_usdt(
+             Some(push_symtab_snapshot_cb),
+             core::ptr::null_mut(),
+         );
++        put_task_ref(task);
+     }
+     if pinned.is_null() {
+         pr_err!("bifrost_guest: usdt slot[{}] igrab returned NULL\n", slot);
+-        return;
++        return -(bindings::ENOENT as i32);
+     }
+     core::ptr::write_bytes(consumer, 0, 1);
+ // shared handler — slot recovered via container-of
+@@ -3134,7 +3331,7 @@ unsafe fn attach_slot_usdt(
+             slot, raw
+         );
+         iput(pinned);
+-        return;
++        return if raw < 0 { raw as c_int } else { -(bindings::EINVAL as i32) };
+     }
+     slots_mut()[slot].uprobe_handle = handle;
+     slots_mut()[slot].uprobe_inode = pinned;
+@@ -3148,6 +3345,7 @@ unsafe fn attach_slot_usdt(
+         core::str::from_utf8(sdt_probe).unwrap_or("?"),
+         pc_off, sema_off
+     );
++    0
+     }
+ }
+ 
+@@ -3178,7 +3376,7 @@ unsafe fn attach_slot_uprobe(
+     uprobe_path_buf: &[u8; 257],
+     uprobe_file_offset: u64,
+     bg: *mut BifrostGuest,
+-) {
++) -> c_int {
+     unsafe {
+     // Defense in depth: caller (slot_family_attach via the
+     // LOAD_PROG dispatch) already called slots_ensure(slot+1).
+@@ -3186,7 +3384,7 @@ unsafe fn attach_slot_uprobe(
+     // that forgets the grow step.
+     if slot >= slots_mut().len() {
+         pr_err!("bifrost_guest: uprobe slot[{}] out of range (len={})\n", slot, slots_mut().len());
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     // Initialize the wrapper's slot field, then expose the consumer
+     // pointer for the kernel uprobe API.  The kernel only sees the
+@@ -3196,7 +3394,7 @@ unsafe fn attach_slot_uprobe(
+     let consumer: *mut bindings::uprobe_consumer = &mut (*bp_ptr).consumer as *mut _;
+     if consumer.is_null() {
+         pr_err!("bifrost_guest: uprobe slot[{}] consumer ptr null\n", slot);
+-        return;
++        return -(bindings::EINVAL as i32);
+     }
+     let mut kpath: bindings::path = bindings::path {
+         mnt: core::ptr::null_mut(),
+@@ -3211,6 +3409,7 @@ unsafe fn attach_slot_uprobe(
+         let task = find_task_by_comm(basename);
+         if !task.is_null() {
+             let exe = get_task_exe_file(task);
++            put_task_ref(task);
+             if !exe.is_null() {
+                 let exe_inode = (*exe).f_inode;
+                 pinned = igrab(exe_inode);
+@@ -3277,7 +3476,7 @@ unsafe fn attach_slot_uprobe(
+             rc,
+             attempts
+         );
+-        return;
++        return if rc != 0 { rc } else { -(bindings::ENOENT as i32) };
+     }
+     pr_info!(
+         "bifrost_guest: uprobe slot[{}] resolved '{}' via {} (attempts={})\n",
+@@ -3322,7 +3521,7 @@ unsafe fn attach_slot_uprobe(
+         if !kpath.dentry.is_null() {
+             path_put(&kpath);
+         }
+-        return;
++        return if raw < 0 { raw as c_int } else { -(bindings::EINVAL as i32) };
+     }
+     slots_mut()[slot].uprobe_handle = handle;
+     slots_mut()[slot].uprobe_inode = pinned;
+@@ -3348,6 +3547,7 @@ unsafe fn attach_slot_uprobe(
+         uprobe_file_offset,
+         name_str
+     );
++    0
+     }
+ }
+ 
+@@ -3451,6 +3651,8 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
+         if !(*bg).thread.is_null() {
+             bindings::kthread_stop((*bg).thread);
+         }
++        bifrost_clear_doorbell_callback();
++        bifrost_clear_shmem_ringbuf();
+ 
+         // Unregister all probes first (before freeing memory they reference).
+         // Per-slot teardown lives in `cleanup_slot_*` helpers above; this
+@@ -3516,6 +3718,8 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
+         }
+         bindings::kfree((*bg).shmem_pfns as *const c_void);
+         bindings::kfree(bg as *const c_void);
++        (*vdev).priv_ = core::ptr::null_mut();
++        BIFROST_DEVICE_LIVE.store(false, Ordering::Release);
+         pr_info!("bifrost_guest: removed\n");
+     }
+ }
+diff --git a/drivers/bifrost/bifrost_helpers.c b/drivers/bifrost/bifrost_helpers.c
+index 204049e5696f..1aad4cbdbb64 100644
+--- a/drivers/bifrost/bifrost_helpers.c
++++ b/drivers/bifrost/bifrost_helpers.c
+@@ -22,19 +22,15 @@
+ 
+ /*
+  * Walk the task list looking for the first task whose `comm` matches
+- * the given basename.  Returns the matching task_struct *, or NULL.
+- * Caller must NOT dereference the returned task pointer outside of an
+- * RCU read-side critical section unless they pin it themselves
+- * (typically via get_task_exe_file, which task_locks internally).
++ * the given basename.  Returns the matching task_struct * with a task
++ * reference held, or NULL.  Caller must release a non-NULL result with
++ * bifrost_helper_put_task_struct().
+  *
+  * `target` may be up to TASK_COMM_LEN-1 (15) bytes — longer prefixes
+  * are truncated to match the kernel's own comm storage.
+  *
+- * The walk runs under rcu_read_lock; the result pointer is briefly
+- * valid after rcu_read_unlock thanks to the RCU grace-period
+- * guarantee, but the caller is expected to immediately call a
+- * task-pinning helper (get_task_exe_file et al.) that elevates the
+- * reference count before doing anything else with the pointer.
++ * The get_task_struct() happens before rcu_read_unlock(), so no raw
++ * unpinned task pointer crosses the C/Rust boundary.
+  */
+ struct task_struct *bifrost_helper_find_task_by_comm(
+ 	const unsigned char *target,
+@@ -68,6 +64,7 @@ struct task_struct *bifrost_helper_find_task_by_comm(
+ 		if (eq && (n == 15 || comm[n] == '\0' ||
+ 			   comm[n] == ' ' || comm[n] == ':')) {
+ 			result = p;
++			get_task_struct(result);
+ 			break;
+ 		}
+ 	}
+@@ -99,6 +96,13 @@ struct task_struct *bifrost_helper_find_task_by_comm(
+ }
+ EXPORT_SYMBOL_GPL(bifrost_helper_find_task_by_comm);
+ 
++void bifrost_helper_put_task_struct(struct task_struct *task)
++{
++	if (task)
++		put_task_struct(task);
++}
++EXPORT_SYMBOL_GPL(bifrost_helper_put_task_struct);
++
+ /*
+  * Read `count` bytes from `file` at `pos` into `buf`.  Thin wrapper
+  * around kernel_read() that retries short reads until it has the
+@@ -1061,9 +1065,10 @@ EXPORT_SYMBOL_GPL(bifrost_helper_emit_symtab_for_file);
+  *     things it'd actually walk in a backtrace)
+  *   - already seen via the dedup table
+  *
+- * Locking: takes mmap_read_lock (NOT trylock — caller is expected
+- * to be in a sleepable context, e.g. the bifrost worker thread or
+- * the uprobe register path, not BPF/kprobe).
++ * Locking: takes mmap_read_lock only long enough to collect and
++ * get_file() a bounded list.  The callback runs after unlocking, so
++ * ELF reads, d_path(), and SHMEM publication do not happen under the
++ * mm lock.
+  */
+ #define BIFROST_VMA_FILE_MAX 32
+ typedef void (*bifrost_vma_file_cb_t)(struct file *file, void *ctx);
+@@ -1074,6 +1079,9 @@ void bifrost_helper_for_each_vma_file(struct task_struct *task,
+ {
+ 	struct mm_struct *mm;
+ 	struct vm_area_struct *vma;
++	struct file *seen[BIFROST_VMA_FILE_MAX];
++	unsigned int n_seen = 0;
++	unsigned int i;
+ 
+ 	if (!task || !cb)
+ 		return;
+@@ -1086,20 +1094,10 @@ void bifrost_helper_for_each_vma_file(struct task_struct *task,
+ 
+ 	mmap_read_lock(mm);
+ 	{
+-		/* `seen` / `n_seen` / `i` are kept in this inner scope
+-		 * deliberately — declared at function top, gcc 16
+-		 * + the kernel's -Werror=unused-variable spuriously
+-		 * fires (the for_each_vma macro expansion creates an
+-		 * intermediate scope the analysis can't see through).
+-		 * Keeping the dedup state co-located with the loop
+-		 * also reads better. */
+-		struct file *seen[BIFROST_VMA_FILE_MAX];
+-		unsigned int n_seen = 0;
+ 		VMA_ITERATOR(vmi, mm, 0);
+ 		for_each_vma(vmi, vma) {
+ 			struct file *f;
+ 			bool dup = false;
+-			unsigned int i;
+ 
+ 			if (n_seen >= BIFROST_VMA_FILE_MAX)
+ 				break;
+@@ -1116,18 +1114,16 @@ void bifrost_helper_for_each_vma_file(struct task_struct *task,
+ 			}
+ 			if (dup)
+ 				continue;
++			get_file(f);
+ 			seen[n_seen++] = f;
+-			/* The cb is invoked while we still hold
+-			 * mmap_read_lock; the file pointer is therefore
+-			 * pinned for the duration of the call (the VMA
+-			 * holds an implicit ref on vm_file).  The Rust
+-			 * callback reads from the file via kernel_read
+-			 * (sleepable) which is fine under
+-			 * mmap_read_lock — we're not in atomic context. */
+-			cb(f, ctx);
+ 		}
+ 	}
+ 	mmap_read_unlock(mm);
++
++	for (i = 0; i < n_seen; i++) {
++		cb(seen[i], ctx);
++		fput(seen[i]);
++	}
+ 	mmput(mm);
+ }
+ EXPORT_SYMBOL_GPL(bifrost_helper_for_each_vma_file);
+@@ -1172,6 +1168,10 @@ static const struct bifrost_kfunc_decl BIFROST_KFUNC_MANIFEST[] = {
+ 		"bifrost_helper_find_task_by_comm",
+ 		"struct task_struct *(const unsigned char *, unsigned int)",
+ 	},
++	{
++		"bifrost_helper_put_task_struct",
++		"void (struct task_struct *)",
++	},
+ 	{
+ 		"bifrost_helper_resolve_symbol",
+ 		"int (struct file *, const u8 *, u32, u64 *, u64 *)",
+diff --git a/drivers/bifrost/task_helpers.rs b/drivers/bifrost/task_helpers.rs
+index 6aa37d81f9f9..9458e318afda 100644
+--- a/drivers/bifrost/task_helpers.rs
++++ b/drivers/bifrost/task_helpers.rs
+@@ -11,20 +11,22 @@
+ 
+ unsafe extern "C" {
+     /// C helper (drivers/bifrost/bifrost_helpers.c) — wraps
+-    /// for_each_process under rcu_read_lock.  Returns NULL on no
+-    /// match.  See the helper file for the locking contract.
++    /// for_each_process under rcu_read_lock. Returns NULL on no
++    /// match, otherwise returns a refcounted task that must be
++    /// released with `bifrost_helper_put_task_struct`.
+     fn bifrost_helper_find_task_by_comm(
+         target: *const u8,
+         target_len: u32,
+     ) -> *mut bindings::task_struct;
++
++    /// Drop the task reference returned by
++    /// `bifrost_helper_find_task_by_comm`.
++    fn bifrost_helper_put_task_struct(task: *mut bindings::task_struct);
+ }
+ 
+ /// Walk `for_each_process` looking for a task whose `comm` matches the
+-/// given basename.  Returns the first match (RCU-protected pointer; the
+-/// caller must hold rcu_read_lock or otherwise guarantee the task is
+-/// not freed while it dereferences the pointer — typically by using
+-/// `get_task_exe_file` immediately, which bumps a refcount on its
+-/// internal state).
++/// given basename. Returns the first match with a task ref held; the
++/// caller must release it with `put_task_ref`.
+ ///
+ /// This is the container-aware uprobe-target resolver: comm is the
+ /// kernel's own truncated-at-15-bytes name for the running task, set
+@@ -34,9 +36,8 @@ fn bifrost_helper_find_task_by_comm(
+ /// kernel mapped — bypassing the need for kern_path's namespace-bound
+ /// lookup entirely.
+ ///
+-/// SAFETY: the caller must use the returned pointer under rcu_read_lock
+-/// or call `get_task_exe_file` immediately to elevate the reference
+-/// before any other use.
++/// SAFETY: the returned pointer is a kernel task pointer. It remains
++/// valid until the caller passes it to `put_task_ref`.
+ pub(crate) unsafe fn find_task_by_comm(target: &[u8]) -> *mut bindings::task_struct {
+     if target.is_empty() {
+         return core::ptr::null_mut();
+@@ -45,3 +46,13 @@ pub(crate) unsafe fn find_task_by_comm(target: &[u8]) -> *mut bindings::task_str
+         bifrost_helper_find_task_by_comm(target.as_ptr(), target.len() as u32)
+     }
+ }
++
++/// Release a task reference returned by `find_task_by_comm`.
++pub(crate) unsafe fn put_task_ref(task: *mut bindings::task_struct) {
++    if task.is_null() {
++        return;
++    }
++    unsafe {
++        bifrost_helper_put_task_struct(task);
++    }
++}
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 013282a2a109..867887a95b09 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -2480,6 +2480,14 @@ int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
+ }
+ EXPORT_SYMBOL_GPL(bifrost_set_shmem_ringbuf);
+ 
++void bifrost_clear_shmem_ringbuf(void)
++{
++	WRITE_ONCE(bifrost_shmem_va, NULL);
++	smp_wmb();
++	WRITE_ONCE(bifrost_shmem_len, 0);
++}
++EXPORT_SYMBOL_GPL(bifrost_clear_shmem_ringbuf);
++
+ /*
+  * Pack the firing task's file-backed VMA table into @buf for the
+  * gustack symbolicator on the host. Each entry describes one VMA's
+@@ -3986,6 +3994,14 @@ int bifrost_set_doorbell_callback(bifrost_kick_fn_t fn, void *priv)
+ }
+ EXPORT_SYMBOL_GPL(bifrost_set_doorbell_callback);
+ 
++void bifrost_clear_doorbell_callback(void)
++{
++	WRITE_ONCE(bifrost_kick_fn, NULL);
++	smp_wmb();
++	WRITE_ONCE(bifrost_kick_priv, NULL);
++}
++EXPORT_SYMBOL_GPL(bifrost_clear_doorbell_callback);
++
+ __bpf_kfunc void bifrost_kfunc_shmem_kick(void)
+ {
+ 	char *base = READ_ONCE(bifrost_shmem_va);
+-- 
+2.50.1 (Apple Git-155)
+

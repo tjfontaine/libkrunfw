@@ -1,0 +1,247 @@
+From b1456805884084231b84f7cbf9989a8ee851a875 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Sun, 17 May 2026 06:39:27 -0700
+Subject: [PATCH] bifrost: re-vendor wire.rs from canonical to fix protocol
+ drift
+
+scripts/check-proto-drift.sh failed because the vendored guest
+wire.rs SHA pin no longer matched canonical host/bifrost-wire/src/
+lib.rs.  Re-vendoring the body and bumping CANONICAL_SHA256 closes
+the drift; the canonical changes were comment-only (protocol-arc
+docstring + lquantize doc), but the SHA pin is the ABI gate.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/bifrost/wire.rs | 149 ++++++++++++++++++++++++++--------------
+ 1 file changed, 97 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index 2886f8bdb1ab..be388ce758f4 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: a236d7ac9cc1ec9475f038b8466b721e22dab4b6e2caa76c11128aedadd42b34
++// CANONICAL_SHA256: 16e98621d4c8c0e44946c87d0d15bbbb3da3a581bb375fcd2037f0a7e9ffac0e
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -9,8 +9,61 @@
+ // a matching re-vendor from the canonical.
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+ //
+-// Wire-format contract for the Bifrost semantic protocol.  This
+-// file is the **canonical** source.  Other layers consume it:
++// Wire-format contract for the Bifrost semantic protocol.
++//
++// ## Protocol arc
++//
++// A bifrost session has four temporal phases:
++//
++//   1. *HELLO handshake.*  Observer side sends
++//      `D4_KIND_OBSERVER_HELLO`; the driver replies with
++//      `D4_KIND_HELLO_ACK` carrying `(wire_major, wire_minor,
++//      feature_bits)`.  `wire_major` mismatch refuses the session;
++//      `wire_minor` is informational and `feature_bits` is the
++//      canonical capability vocabulary.  A `CANONICAL_SHA256` pin
++//      catches same-major drift in the core schema.
++//
++//   2. *LOAD_PROG cohort.*  The CLI builds a BFR7 wrapper
++//      bundling one or more eBPF programs (and the per-program
++//      probe-type discriminants); libkrun ferries the bytes
++//      opaquely.  The driver replies with `RSP_OK` synchronously
++//      once the wrapper parses.  Per-program attach status arrives
++//      asynchronously as `D4_KIND_LOAD_PROG_STATUS` once every
++//      slot has resolved, carrying a `[u8; num_progs]` array of
++//      `RSP_LOADPROG_STATUS_*` codes so partial failures cannot
++//      hide behind the synchronous RSP_OK.
++//
++//   3. *Record streaming.*  BPF programs produce records into a
++//      per-CPU SHMEM ringbuf using the SPSC handshake described
++//      in `host/bifrost/src/control_shmem.rs`; an asynchronous
++//      push channel (`D4_KIND_AGG_PUSH`, `D4_KIND_RECORD_PUSH`,
++//      `D4_KIND_SELF_TRACE_PUSH`) carries pre-formatted text
++//      lines that bypass the rate-limited uprobe path so high-
++//      rate records still reach the CLI reliably.
++//
++//   4. *Drop accounting and trailer.*  Each per-CPU sub-ring
++//      maintains 4-element drop arrays indexed by
++//      `SHMEM_DROP_CLASS_*` (PRINCIPAL / AGG / STKSTR / DBLERR),
++//      so the host can attribute which workload class is
++//      overflowing.  At termination the CLI snapshots the
++//      headers, dumps any pending xagg state, and tears the
++//      session down — there is no explicit GOODBYE; the rings
++//      simply stop being read.
++//
++// ## Why the codec lives in sibling files
++//
++// `codec_*.rs` files split the codec by record kind (`codec_load
++// _prog.rs`, `codec_hello.rs`, ...).  Encode functions own the
++// allocation; decode functions return *view* types that borrow
++// the input buffer rather than copying it, so a record passes
++// from on-the-wire bytes to the CLI's renderer without an
++// allocation per record.  The borrow lifetime ties every field
++// of a `RecordView` back to the original `&[u8]`.
++//
++// ## Canonical source
++//
++// This file is the **canonical** source.  Other layers consume
++// it:
+ //
+ //   guest kernel module:
+ //     third_party/linux-bifrost/drivers/bifrost/wire.rs
+@@ -163,17 +216,16 @@
+ /// renderer can compute
+ /// `sqrt((sum_sq * n - sum*sum) / (n * (n-1)))` at render time.
+ pub const AGG_KIND_STDDEV: u8 = 4;
+-/// `lquantize()` aggregation (W5b). Linear-bucket histogram —
+-/// per-CPU slot is a single u64 bucket counter; map is a
+-/// PERCPU_ARRAY of 64 buckets keyed on `bucket_id: u32`.  Bucket
+-/// boundaries (`base`, `step`, `levels`) live in
+-/// `xagg::LquantizeParams` registered at clause-parse time and
+-/// applied at render time.
++/// `lquantize()` aggregation. Linear-bucket histogram — per-CPU
++/// slot is a single u64 bucket counter; map is a PERCPU_ARRAY of
++/// 64 buckets keyed on `bucket_id: u32`.  Bucket boundaries
++/// (`base`, `step`, `levels`) live in `xagg::LquantizeParams`
++/// registered at clause-parse time and applied at render time.
+ pub const AGG_KIND_LQUANTIZE: u8 = 5;
+-/// `llquantize()` aggregation (W5c). Log-linear-bucket
+-/// histogram — map shape matches `AGG_KIND_LQUANTIZE`; bucket
+-/// boundaries (`factor`, `low_mag`, `high_mag`,
+-/// `steps_per_mag`) live in `xagg::LlquantizeParams`.
++/// `llquantize()` aggregation. Log-linear-bucket histogram —
++/// map shape matches `AGG_KIND_LQUANTIZE`; bucket boundaries
++/// (`factor`, `low_mag`, `high_mag`, `steps_per_mag`) live in
++/// `xagg::LlquantizeParams`.
+ pub const AGG_KIND_LLQUANTIZE: u8 = 6;
+ 
+ // =====================================================================
+@@ -201,10 +253,9 @@
+ pub const SYM_TABLE_PROBE_MAGIC: u32 = SYM_TABLE_PROBE_ID;
+ 
+ // =====================================================================
+-// Self-trace probe IDs.  Phase H of the migration plan
+-// (notes/architecture-diagnosis.md T7, G6 — Bifrost-on-Bifrost).
+-// Reserved IDs at the top of the u32 namespace, just below the
+-// existing *_PROBE_ID range, so user records can never collide.
++// Self-trace probe IDs (Bifrost-on-Bifrost diagnostics).  Reserved
++// IDs at the top of the u32 namespace, just below the existing
++// *_PROBE_ID range, so user records can never collide.
+ //
+ // Records with these probe IDs ride the same SHMEM ringbuf as
+ // user trace records — the only thing that distinguishes them is
+@@ -419,11 +470,12 @@
+ // for non-LOAD_PROG response kinds (OBSERVER_ATTACH/DETACH); LOAD_PROG
+ // responses always carry the array.
+ //
+-// Phase B (notes/architecture-diagnosis.md T1/T2, W1):
+-// closes the silent-failure surface where the guest's "MAX_KPROBES
+-// exceeded" pr_err landed in dmesg only and libkrun forwarded a
+-// single RSP_OK.  Now every program reports its own status — silent
+-// drops become the explicit `SLOT_EXHAUSTED` arm.
++// Every program reports its own per-program status, so a partial
++// failure in one slot of a multi-program LOAD_PROG cohort does not
++// disappear behind the single RSP_OK that libkrun emits on
++// successful wrapper parse.  A guest-side condition like
++// "MAX_KPROBES exceeded" surfaces as the explicit `SLOT_EXHAUSTED`
++// status for the affected slot rather than a silent drop.
+ // =====================================================================
+ 
+ /// Program registered successfully.
+@@ -462,23 +514,21 @@
+ pub const D4_KIND_RECORD_PUSH: u32 = 103;
+ /// Unsolicited push: per-program LOAD_PROG status array, emitted by
+ /// libkrun once the guest has finished processing every program in
+-/// a previously-acked LOAD_PROG cohort.  Body is the codec output
+-/// of `bifrost_wire::codec::encode_loadprog_status` —
++/// the corresponding LOAD_PROG cohort.  Body is the codec output of
++/// `bifrost_wire::codec::encode_loadprog_status` —
+ /// `[u32 LE num_progs][u8; num_progs status]` with status values
+ /// from the `RSP_LOADPROG_STATUS_*` table.  `seq` echoes the
+ /// original LOAD_PROG request's seq so the host CLI can correlate.
+ ///
+-/// Why a separate kind rather than extending `RSP_OK`'s payload:
+-/// the legacy `RSP_OK` reply is emitted **synchronously** by libkrun
+-/// when the wrapper parses cleanly (long before the guest's worker
+-/// has actually attached anything).  Per-program status arrives
+-/// asynchronously after attach.  Distinct kinds keep the temporal
+-/// model honest.
++/// Distinct from `RSP_OK`'s payload because `RSP_OK` is emitted
++/// **synchronously** by libkrun the moment the wrapper parses
++/// cleanly — long before the guest's worker has actually attached
++/// anything.  Per-program status arrives asynchronously after
++/// attach.  Separate kinds keep the temporal model honest.
+ pub const D4_KIND_LOAD_PROG_STATUS: u32 = 104;
+ /// Unsolicited self-trace event push from libkrun (or, in a future
+ /// phase, the guest driver via libkrun's record-forwarding path).
+-/// Phase H emit (notes/architecture-diagnosis.md T7, G6).  Body
+-/// wire format:
++/// Body wire format:
+ ///
+ /// ```text
+ ///   [u32 layer_probe_id LE]   one of SELF_TRACE_DRIVER_PROBE_ID /
+@@ -521,17 +571,17 @@
+ pub const D4_KIND_PAD: u32 = 255;
+ 
+ // =====================================================================
+-// Wire-format version + feature-bit registry.  Phase I (capability
+-// handshake).  Driver and CLI exchange (wire_major, wire_minor,
++// Wire-format version + feature-bit registry — the capability
++// handshake.  Driver and CLI exchange (wire_major, wire_minor,
+ // feature_bits) at OBSERVER_HELLO time:
+ //
+ //   wire_major  Breaking-change version.  Mismatch ⇒ HELLO_ACK refuses
+ //               with HELLO_REJECT_WIRE_MAJOR_MISMATCH.  Bumped when
+ //               an existing record kind's body layout changes
+-//               incompatibly, or a previously-required field is
+-//               removed.  Today's CANONICAL_SHA256 pin still catches
+-//               same-major drift in the core schema; this is the
+-//               coarser knob for cross-major upgrades.
++//               incompatibly, or a required field is removed.  The
++//               CANONICAL_SHA256 pin catches same-major drift in the
++//               core schema; this is the coarser knob for cross-major
++//               upgrades.
+ //
+ //   wire_minor  Additive-change version.  Bumped when a new
+ //               D4_KIND_* lands or a new optional field is added.
+@@ -659,14 +709,13 @@
+ /// Layout version stored next to `SHMEM_MAGIC`. Bump when the SHMEM
+ /// header layout changes incompatibly.
+ ///
+-/// - V4 introduces the per-CPU principal buffer carve (W1 in
+-///   `docs/dtrace-roadmap.md`): the 6 MB ring is split into
+-///   `SHMEM_NUM_CPUS_MAX` sub-rings of `per_cpu_ring_len` each,
+-///   with one cache line of producer / consumer / drop state
+-///   per CPU at offset 128.
+-/// - V5 widens each per-CPU state entry from 64 B to 128 B to
+-///   carry per-class drop arrays (W7, `SHMEM_DROP_CLASS_*`)
+-///   indexed by PRINCIPAL / AGG / STKSTR / DBLERR.
++/// - V4: per-CPU principal buffer carve.  The 6 MB ring splits
++///   into `SHMEM_NUM_CPUS_MAX` sub-rings of `per_cpu_ring_len`
++///   each, with one cache line of producer / consumer / drop
++///   state per CPU at offset 128.
++/// - V5: per-CPU state entry widens from 64 B to 128 B to carry
++///   per-class drop arrays (`SHMEM_DROP_CLASS_*`) indexed by
++///   PRINCIPAL / AGG / STKSTR / DBLERR.
+ pub const SHMEM_VERSION: u32 = 5;
+ /// Cap on per-CPU sub-rings. Hosts with more CPUs than the cap
+ /// share a sub-ring (`smp_processor_id() % num_cpus` selection
+@@ -682,12 +731,8 @@
+ /// from 64 to 128 bytes to fit the per-class drop arrays.
+ pub const SHMEM_PER_CPU_STATE_STRIDE: u32 = 128;
+ 
+-/// W7 drop-class identifiers. Indexes into the per-CPU
+-/// `dropped_records` / `dropped_bytes` arrays added at SHMEM
+-/// V5. The host CLI uses these to attribute which workload
+-/// class (principal event records, aggregation snapshots,
+-/// stack/symtab metadata, or double-fault ERROR clauses) is
+-/// overflowing its sub-ring.
++/// Drop-class identifiers.  The host CLI uses these to attribute
++/// which workload class is overflowing its sub-ring.
+ pub const SHMEM_DROP_CLASS_PRINCIPAL: u32 = 0;
+ pub const SHMEM_DROP_CLASS_AGG: u32 = 1;
+ pub const SHMEM_DROP_CLASS_STKSTR: u32 = 2;
+-- 
+2.50.1 (Apple Git-155)
+

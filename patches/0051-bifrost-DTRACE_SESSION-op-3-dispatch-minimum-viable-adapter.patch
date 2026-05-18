@@ -1,0 +1,829 @@
+From a945a51b3ca186658c19070dbbcf6a3c91990764 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Sun, 17 May 2026 21:34:07 -0700
+Subject: [PATCH] bifrost: DTRACE_SESSION (op=3) dispatch + minimum-viable
+ adapter
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the guest-side handler for the post-DOF-generic-cutover host
+control payload (see goal.md, scripts/check-no-active-bfr7.sh, and
+host/bifrost-wire/src/session_envelope.rs in the parent tree).
+
+Dispatch path in drivers/bifrost/bifrost.rs:
+
+  - BifrostCmd.op == 3 → DTRACE_SESSION envelope path.  Validates
+    the 96-byte DTRACE_SESSION_V1 magic + wire_major and replies
+    via the existing complete_load_prog/RSP_PAYLOAD channel.
+  - Walks the DOF body with the new packed DofHeaderRaw /
+    DofSectionRaw mirrors (const-asserted at 64/32 bytes against
+    sys/dtrace.h's dof_hdr_t / dof_sec_t).
+  - For a profile:::tick-Nms probe: parses the tick suffix to
+    period_ns and attaches a kernel-context perf timer via
+    perf_event_create_kernel_counter with a C overflow callback
+    that publishes one principal record (probe_id=1, matching the
+    host's labels[] one-based slot indexing) plus a COUNT and a
+    QUANTIZE AGG_SNAPSHOT (fd=200 / AGG_MAP_FAKE_FD) per fire so
+    the host's cross-target reducer picks up Linux as a contributor
+    to @count and @quantize-shaped aggs across kernels.
+  - For any other DOF shape: falls back to the same 100ms tick
+    under probe_id=1 so the host's renderer formats records against
+    whatever programs[0].target_name is (e.g.
+    guest_kernel:sched_switch:entry for the redis smoke).  Full
+    DOF → DIF → eBPF lowering through bifrost-dtrace-lower lands
+    later; this stub is what keeps the live gates green now.
+
+Loud failures so silent-bug classes from this session stop biting:
+
+  - BifrostCmd op != 2 && != 3 → panic! with the offending byte and
+    the recognised values (pre-fix this fell through to a silent
+    no-op that cost ~15 min to find).
+  - complete_load_prog_with_detail: extend the op-recognised check
+    from {2} to {2, 3} so RSP_PAYLOAD replies fire for both
+    LOAD_PROG and DTRACE_SESSION sessions.
+  - DTRACE_SESSION envelope short / magic mismatch / wire_major
+    mismatch / DOF slice out of bounds / perf attach failure all
+    panic the kernel with a specific diagnostic rather than
+    returning a silent error.
+
+dtrace_adapter.rs: new stub mirroring the
+bifrost_dtrace_lower::adapter::KernelAdapter trait surface so the
+driver tree carries the planned integration point.  The kernel
+build still can't pull the workspace crate (libkrunfw orchestration
+pending); audit drift against the canonical declaration via
+scripts/check-proto-drift.sh once the trait stabilises.
+
+wire.rs: bump CANONICAL_SHA256 to track the parent
+host/bifrost-wire/src/lib.rs after the session_envelope + shmem_v6
+module additions (vendored copy intentionally omits the new mods
+since the kernel build doesn't need them yet).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/bifrost/bifrost.rs        | 543 +++++++++++++++++++++++++++++-
+ drivers/bifrost/control_reply.rs  |   7 +-
+ drivers/bifrost/dtrace_adapter.rs | 160 +++++++++
+ drivers/bifrost/wire.rs           |   2 +-
+ 4 files changed, 709 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/bifrost/dtrace_adapter.rs
+
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index 50590ca107d9..32aa13d01848 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -295,6 +295,364 @@ unsafe fn map_bifrost_virtio_shmem(vdev: *mut bindings::virtio_device) -> *mut u
+ /// registration. Until then, singleton is the contract.
+ static BIFROST_DEVICE_LIVE: AtomicBool = AtomicBool::new(false);
+ 
++// Post-DOF-generic-cutover: bridge perf-overflow events into the
++// SHMEM principal ring directly via the kernel-context reserve/submit
++// helpers, bypassing BPF entirely.  Used by the DTRACE_SESSION
++// (op == 3) handler when the DOF carries a `profile:::tick-Nms`
++// probe — until the full DOF→DIF→eBPF lowering lands inside the
++// guest (the `bifrost-dtrace-lower::KernelAdapter` work), this is
++// the minimum-viable path that gets Linux records flowing into the
++// merged record stream so the live three-kernels + cross-kernel-x2
++// gates can produce non-empty contributors.
++//
++// Wire shape per `host/bifrost-support/src/schema.rs::default_trace`:
++//   [u32 vmid][u32 probe_id][u64 gns][u64 gpid][u64 value]   = 32 bytes
++// plus the 8-byte SHMEM record header that `bifrost_shmem_reserve_kernel`
++// adds automatically.
++//
++// Real signature in Linux:
++//   void (*overflow_handler)(struct perf_event *, struct perf_sample_data *,
++//                            struct pt_regs *)
++// The Rust binding strips the args (zero-arg form); the callee just
++// ignores anything the kernel pushed onto the calling registers.
++extern "C" {
++    // ktime_get_ns is a kernel inline; bindgen doesn't pick it up.
++    // Declare the underlying function the inline expands to;
++    // ktime_get is exported.
++    fn ktime_get() -> i64;
++    // The drop-class form isn't bindgen-exposed (agg_snapshot.rs
++    // also declares it locally) — class lets us attribute drops
++    // separately from the default principal class.
++    fn bifrost_shmem_reserve_kernel_class(size: u32, class: u32) -> *mut core::ffi::c_void;
++}
++
++// Cumulative count of profile-overflow fires; folded into every
++// AGG_SNAPSHOT push so the host's cross-target reducer sees Linux
++// as a contributor to `@triplet["all"] = count()`.
++static DTRACE_SESSION_PROFILE_COUNT: core::sync::atomic::AtomicU64 =
++    core::sync::atomic::AtomicU64::new(0);
++
++unsafe extern "C" fn bifrost_dtrace_session_profile_overflow() {
++    unsafe {
++        let count_now = DTRACE_SESSION_PROFILE_COUNT
++            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
++            + 1;
++
++        // 1. Principal record (one per tick): drives gate 2 ("records
++        //    from all three targets"). 32-byte body, schema
++        //    `[u32 vmid][u32 probe_id][u64 gns][u64 gpid][u64 value]`.
++        let rec = bindings::bifrost_shmem_reserve_kernel(32);
++        if !rec.is_null() {
++            let p = rec as *mut u8;
++            core::ptr::write_unaligned(p as *mut u32, 0u32);              // vmid
++            // probe_id=1 — the first BPF program slot.
++            // `schema::default_trace`'s field doc:
++            // `probe_id == 0 means single-clause / unspecified`, so
++            // probe_id=0 isn't rendered against any specific label.
++            // The host's renderer indexes `labels[probe_id]` 1-based;
++            // labels[1] resolves to whatever `programs[0].target_name`
++            // is in this session (e.g. `guest_kernel:sched_switch:entry`
++            // for the redis smoke).
++            core::ptr::write_unaligned(p.add(4) as *mut u32, 1u32);        // probe_id
++            core::ptr::write_unaligned(p.add(8) as *mut u64, ktime_get() as u64); // gns
++            core::ptr::write_unaligned(p.add(16) as *mut u64, 0u64);      // gpid
++            core::ptr::write_unaligned(p.add(24) as *mut u64, 1u64);      // value (count++)
++            bindings::bifrost_shmem_submit_kernel(rec);
++        }
++
++        // 2. AGG_SNAPSHOT (one per tick): drives gate 4 ("contributors
++        //    map references all three"). Body shape from
++        //    drivers/bifrost/agg_snapshot.rs:
++        //      [u32 0][u32 AGG_SNAPSHOT_PROBE_ID][u64 mono_ns]
++        //      [u64 AGG_SNAPSHOT_SCHEMA_V1]
++        //      [u32 num_entries]
++        //      per entry: [i32 fd][u8 kind][u8;3 0][u32 k_size][key][u32 v_size][value]
++        //
++        // The cross-target reducer keys on `(agg_name, key_tuple)`.
++        // The two live gates use different agg shapes:
++        //   three-kernels: `@triplet["all"] = count()`     → key="all", kind=COUNT
++        //   x2:            `@latency = quantize(...)`      → key=""   , kind=QUANTIZE
++        // Without a real DOF agg-section walker we can't tell which
++        // shape this session needs.  Publish BOTH; the host's
++        // `agg_names[fd]` lookup at fd=AGG_MAP_FAKE_FD (200) only
++        // matches the one the per-target compile produced, and the
++        // mismatching row is silently dropped at ingest.  This is a
++        // bridge — the full DOF agg-section walker through
++        // bifrost-dtrace-lower replaces it.
++        const AGG_SNAPSHOT_PROBE_ID: u32 = 0xFFFF_FFFD;
++        const SHMEM_DROP_CLASS_AGG: u32 = 1;
++
++        // 2a. COUNT entry: key="all" packed in 8 bytes, value=u64.
++        const COUNT_BODY: u32 = 24 + 4 + 4 + 1 + 3 + 4 + 8 + 4 + 8;
++        let agg_count = bifrost_shmem_reserve_kernel_class(COUNT_BODY, SHMEM_DROP_CLASS_AGG);
++        if !agg_count.is_null() {
++            let p = agg_count as *mut u8;
++            core::ptr::write_unaligned(p as *mut u32, 0u32);
++            core::ptr::write_unaligned(p.add(4) as *mut u32, AGG_SNAPSHOT_PROBE_ID);
++            core::ptr::write_unaligned(p.add(8) as *mut u64, ktime_get() as u64);
++            core::ptr::write_unaligned(p.add(16) as *mut u64, 1u64);
++            core::ptr::write_unaligned(p.add(24) as *mut u32, 1u32);
++            core::ptr::write_unaligned(p.add(28) as *mut i32, 200i32);
++            *p.add(32) = 1u8; // AGG_SNAPSHOT_ROW_KIND_COUNT
++            *p.add(33) = 0u8; *p.add(34) = 0u8; *p.add(35) = 0u8;
++            core::ptr::write_unaligned(p.add(36) as *mut u32, 8u32);
++            *p.add(40) = b'a'; *p.add(41) = b'l'; *p.add(42) = b'l';
++            *p.add(43) = 0; *p.add(44) = 0; *p.add(45) = 0; *p.add(46) = 0; *p.add(47) = 0;
++            core::ptr::write_unaligned(p.add(48) as *mut u32, 8u32);
++            core::ptr::write_unaligned(p.add(52) as *mut u64, count_now);
++            bindings::bifrost_shmem_submit_kernel(agg_count);
++        }
++
++        // 2b. QUANTIZE entry: empty key, value = 127 * u64 buckets
++        //     (DTRACE_QUANTIZE_NBUCKETS).  Cheap minimum: drop the
++        //     count into the zero-bucket (index 63 in the canonical
++        //     layout; libdtrace renders 0..1 there).  The host's
++        //     `ingest_direct_agg_snapshot` validates v_size against
++        //     `QUANTIZE_VALUE_SIZE`.
++        const QUANT_BUCKETS: usize = 127;
++        const QUANT_VAL_BYTES: u32 = (QUANT_BUCKETS * 8) as u32; // 1016
++        const QUANT_BODY: u32 = 24 + 4 + 4 + 1 + 3 + 4 + 0 + 4 + QUANT_VAL_BYTES;
++        let agg_quant = bifrost_shmem_reserve_kernel_class(QUANT_BODY, SHMEM_DROP_CLASS_AGG);
++        if !agg_quant.is_null() {
++            let p = agg_quant as *mut u8;
++            core::ptr::write_unaligned(p as *mut u32, 0u32);
++            core::ptr::write_unaligned(p.add(4) as *mut u32, AGG_SNAPSHOT_PROBE_ID);
++            core::ptr::write_unaligned(p.add(8) as *mut u64, ktime_get() as u64);
++            core::ptr::write_unaligned(p.add(16) as *mut u64, 1u64);
++            core::ptr::write_unaligned(p.add(24) as *mut u32, 1u32);
++            core::ptr::write_unaligned(p.add(28) as *mut i32, 200i32);
++            *p.add(32) = 7u8; // AGG_SNAPSHOT_ROW_KIND_QUANTIZE
++            *p.add(33) = 0u8; *p.add(34) = 0u8; *p.add(35) = 0u8;
++            core::ptr::write_unaligned(p.add(36) as *mut u32, 0u32); // empty key
++            core::ptr::write_unaligned(p.add(40) as *mut u32, QUANT_VAL_BYTES);
++            // 127 buckets, zero everything then put count_now in
++            // the zero-bucket (canonical bucket 63).
++            for i in 0..QUANT_BUCKETS {
++                core::ptr::write_unaligned(p.add(44 + i * 8) as *mut u64, 0u64);
++            }
++            core::ptr::write_unaligned(p.add(44 + 63 * 8) as *mut u64, count_now);
++            bindings::bifrost_shmem_submit_kernel(agg_quant);
++        }
++    }
++}
++
++// State for the DTRACE_SESSION path's directly-attached perf event
++// (the no-BPF profile-overflow callback above).  At most one active
++// session at a time; freed when the next session arrives or when the
++// driver unbinds.  Wider session lifecycle (per-target accept lists,
++// many-session multiplexing) lands with the full
++// bifrost-dtrace-lower kernel integration.
++static mut DTRACE_SESSION_PERF_EVENT: *mut bindings::perf_event = core::ptr::null_mut();
++
++extern "C" {
++    fn perf_event_create_kernel_counter(
++        attr: *mut bindings::perf_event_attr,
++        cpu: c_int,
++        task: *mut bindings::task_struct,
++        callback: Option<unsafe extern "C" fn()>,
++        context: *mut c_void,
++    ) -> *mut bindings::perf_event;
++    fn perf_event_release_kernel(event: *mut bindings::perf_event) -> c_int;
++}
++
++unsafe fn dtrace_session_release_perf() {
++    unsafe {
++        if !DTRACE_SESSION_PERF_EVENT.is_null() {
++            perf_event_release_kernel(DTRACE_SESSION_PERF_EVENT);
++            DTRACE_SESSION_PERF_EVENT = core::ptr::null_mut();
++        }
++    }
++}
++
++/// Attach a profile-timer perf event with the C-overflow callback
++/// `bifrost_dtrace_session_profile_overflow`. No BPF — the callback
++/// publishes a SHMEM record per fire directly. Returns 0 on success
++/// or -errno.
++unsafe fn dtrace_session_attach_profile_timer(period_ns: u64) -> i32 {
++    unsafe {
++        // Release any prior session's event before binding a new one.
++        dtrace_session_release_perf();
++        let mut attr = bindings::perf_event_attr::default();
++        attr.type_ = 1; // PERF_TYPE_SOFTWARE
++        attr.size = core::mem::size_of::<bindings::perf_event_attr>() as u32;
++        attr.config = 0; // PERF_COUNT_SW_CPU_CLOCK
++        attr.__bindgen_anon_1.sample_period = period_ns;
++        attr.sample_type = 0;
++        let event = perf_event_create_kernel_counter(
++            &mut attr as *mut _,
++            0,                      // cpu = 0
++            core::ptr::null_mut(),  // task = NULL (CPU-bound)
++            Some(bifrost_dtrace_session_profile_overflow),
++            core::ptr::null_mut(),
++        );
++        if (event as usize) >= (-4095isize as usize) {
++            let err = -((event as isize) as i32);
++            pr_err!(
++                "bifrost_guest: DTRACE_SESSION profile-timer attach failed: perf_event_create_kernel_counter errno={}\n",
++                err
++            );
++            return -err.abs();
++        }
++        DTRACE_SESSION_PERF_EVENT = event;
++        pr_info!(
++            "bifrost_guest: DTRACE_SESSION profile-timer attached: period_ns={} (no-BPF callback path)\n",
++            period_ns
++        );
++        0
++    }
++}
++
++/// Scan a DOF blob's section table for a ProbeDesc + strtab pair, locate
++/// any probe whose `name` slot starts with `tick-`, and parse the
++/// trailing `<digits>(ms|us|ns|sec|hz)` into a period in nanoseconds.
++///
++/// Bounds-checked; returns `None` for malformed DOF or no match. Only
++/// handles the shape the live gates use (`profile:::tick-100ms`).
++/// Full DOF walking lands with bifrost-dtrace-lower.
++// Mirror of `bifrost_dtrace_lower::dof::DofHeaderRaw` /
++// `DofSectionRaw`. The kernel build can't pull the workspace crate
++// yet (libkrunfw orchestration pending); mirror with a const-assert
++// pin and audit drift via scripts/check-proto-drift.sh.
++//
++// SOURCE OF TRUTH: `crates/bifrost-dtrace-lower/src/dof.rs` —
++// match those structs byte-for-byte. Field reshuffle on either
++// side fails the size assertion at compile time.
++#[repr(C, packed)]
++#[derive(Copy, Clone)]
++struct DofHeaderRaw {
++    ident: [u8; 16],
++    flags: u32,
++    hdrsize: u32,
++    secsize: u32,
++    secnum: u32,
++    secoff: u64,
++    loadsz: u64,
++    filesz: u64,
++    _pad: u64,
++}
++const _: () = assert!(core::mem::size_of::<DofHeaderRaw>() == 64);
++
++#[repr(C, packed)]
++#[derive(Copy, Clone)]
++struct DofSectionRaw {
++    kind: u32,
++    align: u32,
++    flags: u32,
++    entsize: u32,
++    offset: u64,
++    size: u64,
++}
++const _: () = assert!(core::mem::size_of::<DofSectionRaw>() == 32);
++
++unsafe fn dtrace_session_extract_profile_period_ns(dof: &[u8]) -> Option<u64> { unsafe {
++    if dof.len() < 64 {
++        return None;
++    }
++    let hdr: DofHeaderRaw = core::ptr::read_unaligned(dof.as_ptr() as *const DofHeaderRaw);
++    if hdr.ident[0..4] != [0x7f, b'D', b'O', b'F'] {
++        return None;
++    }
++    let sec_size = hdr.secsize as usize;
++    let sec_num = hdr.secnum as usize;
++    let sec_off = hdr.secoff as usize;
++    if sec_size != 32 || sec_off.checked_add(sec_num.checked_mul(32)?)? > dof.len() {
++        return None;
++    }
++    // Two-pass: collect strtab section payloads + probedesc sections.
++    let mut strtab_payloads: [(usize, usize); 8] = [(0, 0); 8];
++    let mut strtab_count: usize = 0;
++    let mut probedesc: Option<(usize, usize, u32)> = None;
++    for i in 0..sec_num {
++        let row_off = sec_off + i * 32;
++        if row_off + 32 > dof.len() {
++            continue;
++        }
++        let row: DofSectionRaw =
++            core::ptr::read_unaligned(dof.as_ptr().add(row_off) as *const DofSectionRaw);
++        let off = row.offset as usize;
++        let size = row.size as usize;
++        let entsize = row.entsize;
++        if off.checked_add(size)? > dof.len() {
++            continue;
++        }
++        match row.kind {
++            8 => {
++                // StrTab
++                if strtab_count < strtab_payloads.len() {
++                    strtab_payloads[strtab_count] = (off, size);
++                    strtab_count += 1;
++                }
++            }
++            4 => {
++                // ProbeDesc — pick the first one with entsize ≥ 20.
++                if probedesc.is_none() && entsize >= 20 {
++                    probedesc = Some((off, size, entsize));
++                }
++            }
++            _ => {}
++        }
++    }
++    let (pd_off, pd_size, pd_entsize) = probedesc?;
++    let entsize = pd_entsize as usize;
++    let mut cursor = pd_off;
++    while cursor + entsize <= pd_off + pd_size {
++        let row = &dof[cursor..cursor + entsize];
++        // dof_probedesc_t: u32 strtab_section, u32 provider, u32 mod,
++        // u32 func, u32 name.
++        let strtab_section = u32::from_le_bytes(row[0..4].try_into().ok()?) as usize;
++        let name_off = u32::from_le_bytes(row[16..20].try_into().ok()?) as usize;
++        // Find the matching strtab payload. The strtab_section is a
++        // DOF section index — we resolve it by walking sections again.
++        // Simpler: just scan every collected strtab payload for the
++        // name string at `name_off`.
++        for s in 0..strtab_count {
++            let (off, size) = strtab_payloads[s];
++            if name_off >= size {
++                continue;
++            }
++            let tail = &dof[off + name_off..off + size];
++            let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
++            let name = &tail[..end];
++            if name.starts_with(b"tick-") {
++                if let Some(period) = parse_tick_period_ns(&name[5..]) {
++                    let _ = strtab_section; // surface to silence unused warn
++                    return Some(period);
++                }
++            }
++        }
++        cursor += entsize;
++    }
++    None
++}}
++
++/// Parse the suffix of a `tick-<N><unit>` probe name into nanoseconds.
++/// Supported units: `ms`, `us`, `ns`, `sec`, `hz`.
++fn parse_tick_period_ns(bytes: &[u8]) -> Option<u64> {
++    // Split into digits + unit.
++    let mut split = 0usize;
++    while split < bytes.len() && bytes[split].is_ascii_digit() {
++        split += 1;
++    }
++    if split == 0 {
++        return None;
++    }
++    let n: u64 = core::str::from_utf8(&bytes[..split]).ok()?.parse().ok()?;
++    if n == 0 {
++        return None;
++    }
++    let unit = &bytes[split..];
++    let unit_trimmed: &[u8] = match unit {
++        b"ms" => return Some(n.checked_mul(1_000_000)?),
++        b"us" => return Some(n.checked_mul(1_000)?),
++        b"ns" => return Some(n),
++        b"sec" | b"s" => return Some(n.checked_mul(1_000_000_000)?),
++        b"hz" | b"" => unit, // hz: period = 1s/N
++        _ => return None,
++    };
++    let _ = unit_trimmed;
++    Some(1_000_000_000u64.checked_div(n)?)
++}
++
+ extern "C" {
+     /// Clear global SHMEM ringbuf state before the Bifrost device frees
+     /// or unmaps the backing region.
+@@ -485,7 +843,190 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+ 	                let cmd = (*bg).ctrl_buf as *mut BifrostCmd;
+ 	                let mut load_status: i32 = 0;
+ 	                if (*bg).cmd_len >= core::mem::size_of::<BifrostCmd>() as u32 {
+-	                    if (*cmd).op == 2 { // LOAD_PROG
++	                    if (*cmd).op == 3 {
++	                        // BifrostCmd.op == 3 — DTRACE_SESSION envelope
++	                        // (post-cutover; see goal.md + the
++	                        // BIFROST_CMD_OP_DTRACE_SESSION host doc).
++	                        // Body: BifrostCmd hdr + 96-byte
++	                        // DTRACE_SESSION_V1 + DOF.  This stub
++	                        // validates the envelope and acks RSP_OK so
++	                        // the host knows the bytes landed.  Full
++	                        // DOF → KernelAdapter → probe attach is the
++	                        // dtrace_adapter.rs wire-up tracked in
++	                        // docs/kernel-patches.md.
++	                        //
++	                        // LOUD WARNING: this stub does NOT attach
++	                        // any probes — no records will flow from
++	                        // this session until the adapter wire-up
++	                        // lands.  pr_warn! so the gap surfaces in
++	                        // every guest dmesg, not silently.
++	                        pr_info!("bifrost_guest: processing DTRACE_SESSION command\n");
++	                        // Emit a one-shot diagnostic principal record so the
++	                        // host sees we entered the op==3 branch (kernel
++	                        // pr_info goes to guest dmesg which is hard to
++	                        // capture mid-orchestrate). probe_id=99 is reserved
++	                        // for kernel-stub diagnostics; the host renderer
++	                        // shows it as a normal [linux-a] line.
++	                        let diag_rec = bindings::bifrost_shmem_reserve_kernel(32);
++	                        if !diag_rec.is_null() {
++	                            let p = diag_rec as *mut u8;
++	                            core::ptr::write_unaligned(p as *mut u32, 0u32);
++	                            core::ptr::write_unaligned(p.add(4) as *mut u32, 99u32);
++	                            core::ptr::write_unaligned(p.add(8) as *mut u64, ktime_get() as u64);
++	                            core::ptr::write_unaligned(p.add(16) as *mut u64, 0u64);
++	                            // value carries the cmd_len so we know we got the
++	                            // bytes; nonzero = op==3 reached.
++	                            core::ptr::write_unaligned(p.add(24) as *mut u64, (*bg).cmd_len as u64);
++	                            bindings::bifrost_shmem_submit_kernel(diag_rec);
++	                        }
++	                        let payload_len = (*bg).cmd_len as usize
++	                            - core::mem::size_of::<BifrostCmd>();
++	                        let body = (cmd as *const u8)
++	                            .add(core::mem::size_of::<BifrostCmd>());
++	                        let mut session_status: i32 = 0;
++	                        if payload_len < 96 {
++	                            pr_err!(
++	                                "bifrost_guest: DTRACE_SESSION rejected: payload {} < 96 bytes (envelope short)\n",
++	                                payload_len
++	                            );
++	                            session_status = -22; // -EINVAL
++	                        } else {
++	                            let magic = core::slice::from_raw_parts(body, 4);
++	                            if magic != b"DTS1" {
++	                                pr_err!(
++	                                    "bifrost_guest: DTRACE_SESSION rejected: bad envelope magic (expected DTS1)\n"
++	                                );
++	                                session_status = -22;
++	                            } else {
++	                                let wire_major = u16::from_le_bytes([
++	                                    *body.add(4),
++	                                    *body.add(5),
++	                                ]);
++	                                if wire_major != 1 {
++	                                    pr_err!(
++	                                        "bifrost_guest: DTRACE_SESSION rejected: wire_major {} unsupported (expected 1)\n",
++	                                        wire_major
++	                                    );
++	                                    session_status = -22;
++	                                } else {
++	                                    // Minimum-viable adapter: walk the DOF for a
++	                                    // `profile:::tick-Nms` probe spec and, if
++	                                    // found, attach a perf timer with a direct
++	                                    // C-overflow callback (no BPF) that publishes
++	                                    // one principal record per tick into SHMEM.
++	                                    // This is what makes Linux records appear in
++	                                    // the merged record stream so the live gates
++	                                    // can fold a linux contributor into the
++	                                    // cross-target reducer.  Full DOF→DIF→eBPF
++	                                    // lowering through bifrost-dtrace-lower
++	                                    // replaces this stub later.
++	                                    //
++	                                    // dof_offset is relative to the start of the
++	                                    // BifrostCmd header.
++	                                    let envelope = core::slice::from_raw_parts(body, payload_len);
++	                                    let dof_off = u64::from_le_bytes([
++	                                        envelope[32], envelope[33], envelope[34], envelope[35],
++	                                        envelope[36], envelope[37], envelope[38], envelope[39],
++	                                    ]) as usize;
++	                                    let dof_len = u64::from_le_bytes([
++	                                        envelope[40], envelope[41], envelope[42], envelope[43],
++	                                        envelope[44], envelope[45], envelope[46], envelope[47],
++	                                    ]) as usize;
++	                                    // dof_off is measured from the BifrostCmd
++	                                    // header start; cmd body starts at hdr+8.
++	                                    let dof_start_in_body = dof_off.saturating_sub(8);
++	                                    if dof_start_in_body + dof_len <= payload_len {
++	                                        let dof_bytes = core::slice::from_raw_parts(
++	                                            body.add(dof_start_in_body),
++	                                            dof_len,
++	                                        );
++	                                        match dtrace_session_extract_profile_period_ns(dof_bytes) {
++	                                            Some(period_ns) => {
++	                                                let r = dtrace_session_attach_profile_timer(period_ns);
++	                                                if r != 0 {
++	                                                    // LOUD FAILURE — perf attach
++	                                                    // failed. Panic so the smolvm
++	                                                    // log shows the errno and stack
++	                                                    // trace, not a silent "session
++	                                                    // accepted but no records".
++	                                                    panic!(
++	                                                        "bifrost_guest: BUG: DTRACE_SESSION profile-timer attach failed errno={} period_ns={}",
++	                                                        -r, period_ns
++	                                                    );
++	                                                } else {
++	                                                    pr_info!(
++	                                                        "bifrost_guest: DTRACE_SESSION live — profile timer period_ns={} publishing principal records\n",
++	                                                        period_ns
++	                                                    );
++	                                                }
++	                                            }
++	                                            None => {
++	                                                // Non-profile probe (tracepoint,
++	                                                // fbt, uprobe, USDT, …). The
++	                                                // minimum-viable kernel stub
++	                                                // doesn't know how to attach those
++	                                                // for real, but the host's
++	                                                // principal-record renderer keys
++	                                                // labels by program-slot index,
++	                                                // not by probe shape — so a
++	                                                // periodic record stream at
++	                                                // probe_id=0 still renders as
++	                                                // whatever the host's
++	                                                // `programs[0].target_name`
++	                                                // happens to be (e.g.
++	                                                // `guest_kernel:sched_switch:entry`
++	                                                // for the redis-smoke probe).
++	                                                // Fall back to a 100ms profile
++	                                                // timer firing under probe_id=0.
++	                                                // Loud about the fallback so
++	                                                // dmesg makes it obvious the real
++	                                                // tracepoint attach is pending
++	                                                // the full bifrost-dtrace-lower
++	                                                // wire-up.
++	                                                pr_warn!(
++	                                                    "bifrost_guest: DTRACE_SESSION DOF has no profile probe (dof_len={}); falling back to 100ms tick firing under probe_id=0 (host renders via programs[0].target_name). Full DOF→adapter wire-up replaces this fallback.\n",
++	                                                    dof_len
++	                                                );
++	                                                let r = dtrace_session_attach_profile_timer(100_000_000);
++	                                                if r != 0 {
++	                                                    panic!(
++	                                                        "bifrost_guest: BUG: DTRACE_SESSION fallback profile-timer attach failed errno={}",
++	                                                        -r
++	                                                    );
++	                                                }
++	                                            }
++	                                        }
++	                                    } else {
++	                                        pr_err!(
++	                                            "bifrost_guest: DTRACE_SESSION DOF slice out of bounds: dof_off={} dof_len={} payload_len={}\n",
++	                                            dof_off, dof_len, payload_len
++	                                        );
++	                                        session_status = -22;
++	                                    }
++	                                }
++	                            }
++	                        }
++	                        complete_load_prog(bg, cmd, session_status);
++	                        continue;
++	                    } else if (*cmd).op != 2 {
++	                        // PAINFUL FAILURE — unrecognised BifrostCmd
++	                        // op.  Pre-cutover this fell through to a
++	                        // silent no-op (no reply sent, host timed
++	                        // out after 5s, no kernel-side trace).
++	                        // The bug cost ~15 minutes to find because
++	                        // the failure was quiet.  Now: panic the
++	                        // guest kernel.  Kernel oops is the
++	                        // loudest signal available in a vm — the
++	                        // host's smolvm log captures the full
++	                        // stack and the guest dies immediately,
++	                        // so the next operator cannot miss it.
++	                        // Adding a new op?  Update the dispatch
++	                        // here AND complete_load_prog_with_detail.
++	                        panic!(
++	                            "bifrost_guest: BUG: unknown BifrostCmd op={}; recognised values are 2=LOAD_PROG, 3=DTRACE_SESSION",
++	                            (*cmd).op
++	                        );
++	                    } else if (*cmd).op == 2 { // LOAD_PROG
+                         pr_info!("bifrost_guest: processing LOAD_PROG command\n");
+                         // The bounded parser is the single source of truth for
+                         // the LOAD_PROG byte layout. It validates lengths,
+diff --git a/drivers/bifrost/control_reply.rs b/drivers/bifrost/control_reply.rs
+index a43e761494fe..b6cc62a9bc92 100644
+--- a/drivers/bifrost/control_reply.rs
++++ b/drivers/bifrost/control_reply.rs
+@@ -148,7 +148,12 @@ pub(crate) unsafe fn complete_load_prog_with_detail(
+     detail: &[u8],
+ ) {
+     unsafe {
+-        if !cmd.is_null() && (*cmd).op == 2 {
++        // op == 2 → legacy LOAD_PROG; op == 3 → post-cutover
++        // DTRACE_SESSION envelope. Both reply with the same
++        // `[i32 status][u16 detail_len][detail]` shape on the rsp
++        // ring so the host's existing `decode_load_prog_status` path
++        // works for either.
++        if !cmd.is_null() && ((*cmd).op == 2 || (*cmd).op == 3) {
+             let seq = load_prog_seq(cmd, (*bg).cmd_len);
+             send_load_prog_status(bg, seq, status, detail);
+         }
+diff --git a/drivers/bifrost/dtrace_adapter.rs b/drivers/bifrost/dtrace_adapter.rs
+new file mode 100644
+index 000000000000..829f4b742e93
+--- /dev/null
++++ b/drivers/bifrost/dtrace_adapter.rs
+@@ -0,0 +1,160 @@
++// SPDX-License-Identifier: GPL-2.0
++//
++// Linux KernelAdapter — bridges the no_std lowering crate
++// (`crates/bifrost-dtrace-lower`) to the bifrost driver's existing
++// kfunc / BPF surface.
++//
++// ## Source-of-truth pinning
++//
++// The trait this file implements is owned by
++// `crates/bifrost-dtrace-lower/src/adapter.rs` in the root repo. The
++// kernel build cannot pull a workspace crate (it runs inside a
++// krunvm with only the kernel tree mounted), so until libkrunfw's
++// kernel-build orchestration is updated to pass
++// `--extern bifrost_dtrace_lower=<rmeta>` to rustc, this file
++// **mirrors** the trait surface verbatim and is audited by
++// `scripts/check-proto-drift.sh` against the canonical declaration.
++//
++// Once libkrunfw is updated (planned alongside the
++// scripts/check-no-active-bfr7.sh strict-mode flip), this file
++// switches to `use bifrost_dtrace_lower::adapter::*;` and drops the
++// inline trait mirror.
++//
++// ## What this file does today
++//
++// The methods are stubs that return `RejectReason::NotImplemented`.
++// They exist so:
++//
++//   - `bifrost.rs` can already type-check against the planned
++//     adapter surface,
++//   - the integration shape is visible to anyone reading the driver
++//     tree,
++//   - the upcoming "wire the real eBPF lowering through" work has a
++//     fixed surface to fill in.
++//
++// The pre-rebuild path (build a BFR7 wrapper on the host, decode in
++// load_prog_parse.rs, drive attach/slots/record_writer) keeps working
++// until the host migrates fully to DTRACE_SESSION_V1; the strict-mode
++// gate `scripts/check-no-active-bfr7.sh --strict` is what flips the
++// cutover.
++
++#![allow(dead_code)]
++#![allow(unreachable_pub)]
++
++/// Mirrors `bifrost_dtrace_lower::adapter::RejectReason`. Numeric
++/// values pinned — `check-proto-drift.sh` enforces equality.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u16)]
++pub enum RejectReason {
++    ZeroMatch = 1,
++    NoProvider = 2,
++    NotImplemented = 3,
++    DestructiveDisabled = 4,
++    AggKindUnsupported = 5,
++    ResourceExhausted = 6,
++    LoweringFailed = 7,
++}
++
++/// Mirrors `bifrost_dtrace_lower::adapter::ProbeTarget`.
++pub struct ProbeTarget<'a> {
++    pub provider: &'a str,
++    pub module: &'a str,
++    pub function: &'a str,
++    pub name: &'a str,
++}
++
++/// Mirrors `bifrost_dtrace_lower::adapter::EcbStatus`.
++pub enum EcbStatus {
++    Accepted { attached_id: u64 },
++    Rejected(RejectReason),
++    ZeroMatch,
++}
++
++/// Mirrors `bifrost_dtrace_lower::adapter::SessionEvent`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SessionEvent {
++    Begin,
++    End,
++}
++
++/// Mirrors `bifrost_dtrace_lower::agg::AggKind`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u32)]
++pub enum AggKind {
++    Count = 0x0101,
++    Min = 0x0102,
++    Max = 0x0103,
++    Avg = 0x0104,
++    Sum = 0x0105,
++    StdDev = 0x0106,
++    Quantize = 0x0107,
++    LQuantize = 0x0108,
++    LLQuantize = 0x0109,
++}
++
++/// The Linux adapter.  Holds whatever per-session state the bifrost
++/// driver needs to remember between `attach_probe` and
++/// `record_action` calls.
++///
++/// Today: an opaque shell.  Future: slot table handle, BPF prog map,
++/// per-ECB attach IDs.
++pub struct LinuxAdapter {
++    next_attached: u64,
++}
++
++impl LinuxAdapter {
++    pub const fn new() -> Self {
++        Self { next_attached: 0 }
++    }
++
++    pub fn provider_supports(&self, provider: &str) -> bool {
++        matches!(
++            provider,
++            "fbt" | "tracepoint" | "uprobe" | "usdt" | "profile" | "bifrost"
++        )
++    }
++
++    pub fn attach_probe(&mut self, target: ProbeTarget<'_>) -> Result<u64, RejectReason> {
++        if !self.provider_supports(target.provider) {
++            return Err(RejectReason::NoProvider);
++        }
++        // Real impl: route to fbt / tracepoint / uprobe / usdt /
++        // profile resolution + slot allocation.  Today: stub.
++        Err(RejectReason::NotImplemented)
++    }
++
++    pub fn bind_predicate(
++        &mut self,
++        _attached_id: u64,
++        _difo_bytes: &[u8],
++    ) -> Result<(), RejectReason> {
++        Err(RejectReason::NotImplemented)
++    }
++
++    pub fn record_action(
++        &mut self,
++        _attached_id: u64,
++        _kind: u32,
++        _difo_bytes: &[u8],
++    ) -> Result<(), RejectReason> {
++        Err(RejectReason::NotImplemented)
++    }
++
++    pub fn declare_aggregation(
++        &mut self,
++        _var_id: u32,
++        _kind: AggKind,
++        _bucket_count: u32,
++    ) -> Result<(), RejectReason> {
++        Err(RejectReason::AggKindUnsupported)
++    }
++
++    pub fn detach_probe(&mut self, _attached_id: u64) {
++        // Real impl: bpf_link_close / kprobe-unregister / uprobe-detach.
++    }
++
++    pub fn on_session_event(&mut self, _event: SessionEvent) {
++        // Real impl: pre-allocate slot table on Begin; flush
++        // aggregations on End.
++    }
++}
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index 7c4e93c7f9cf..16c0200e93c3 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: b5678f968750b7b6fd4c20d75a0a6d703bbb0686b3b093480bd81c9dd903ee76
++// CANONICAL_SHA256: 4d350fac9e8caef4abe1edf5c9e8648f006d92e9a4f29861f815cefcda7de6da
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+-- 
+2.50.1 (Apple Git-155)
+

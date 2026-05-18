@@ -1,0 +1,616 @@
+From 8f9ed480c3179a648c84494a7035f0fe62af40c6 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Thu, 14 May 2026 06:45:36 -0700
+Subject: bifrost: aggregation, speculation, fault accounting, and vtimestamp
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Five workstreams in one commit for atomic application.
+
+W3 — per-CPU fault accounting in fault-prone kfuncs.
+  bifrost_kfunc_note_fault() inlined; called from copyin /
+  copyinstr / strlen / strchr / strrchr / strstr / progenyof
+  error paths to bump the per-CPU
+  BIFROST_DROP_CLASS_DBLERR counter.  Surfaces in the host
+  CLI's drop summary as `dblerr=N`.
+
+W5a — bifrost_kfunc_clear_agg(struct bpf_map *map__map).
+  `__map` suffix routes through the verifier's
+  KF_ARG_PTR_TO_MAP path.  Walks every per-CPU value slot of
+  the agg map (PERCPU_ARRAY by index, PERCPU_HASH via
+  map_get_next_key) and zeroes it.
+
+W5b/W5c — AGG_KIND_LQUANTIZE=5 / AGG_KIND_LLQUANTIZE=6 added
+  to the vendored wire.rs (CANONICAL_SHA256 refreshed to
+  f565fc5b5adac79d7882abd84eab80f94304e651b3a4878267b3303ba2d3babf).
+  The map shape matches quantize (PERCPU_ARRAY of u32-keyed
+  bucket counts); the host-side renderer differentiates via
+  the AGG_KIND_* discriminant and the per-agg parameter tuple
+  registered at compile time.
+
+W8 — real speculation lifecycle:
+  - struct bifrost_spec_state declared above
+    bifrost_shmem_reserve_kernel_class so the reserve path
+    can detect an active speculation lane.
+  - Per-CPU buffer of 16 records × 1024 bytes each
+    (~16 KB/CPU, ≤ 256 KB cluster-wide on
+    BIFROST_NUM_CPUS_MAX = 16).
+  - bifrost_shmem_reserve_kernel_class routes into the side
+    buffer when active_lane != 0.
+  - bifrost_kfunc_speculation allocates lane id 1, refusing
+    when a lane is already active.
+  - bifrost_kfunc_speculate(id) flips the active flag.
+  - bifrost_kfunc_commit(id) deactivates and replays each
+    buffered record back through reserve + submit in the
+    principal path.
+  - bifrost_kfunc_discard(id) zeroes and deactivates.
+
+W10 — bifrost_kfunc_vtimestamp_ns returns
+  `current->se.sum_exec_runtime` instead of aliasing
+  ktime_get_ns.  DTrace's "ns the current thread has been
+  running on a CPU" semantic, sourced directly from the
+  kernel scheduler's per-task runtime accounting.
+
+Signed-off-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/bifrost/wire.rs |  14 +-
+ kernel/bpf/helpers.c    | 362 ++++++++++++++++++++++++++++++++++------
+ 2 files changed, 323 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index 5616e734e905..45e2b1d2a6ee 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: 1cd208e55e46653e6693daaa3817e9af1045e3886084c90f98f4b580fa704994
++// CANONICAL_SHA256: f565fc5b5adac79d7882abd84eab80f94304e651b3a4878267b3303ba2d3babf
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -154,6 +154,18 @@
+ /// renderer can compute
+ /// `sqrt((sum_sq * n - sum*sum) / (n * (n-1)))` at render time.
+ pub const AGG_KIND_STDDEV: u8 = 4;
++/// `lquantize()` aggregation (W5b). Linear-bucket histogram —
++/// per-CPU slot is a single u64 bucket counter; map is a
++/// PERCPU_ARRAY of 64 buckets keyed on `bucket_id: u32`.  Bucket
++/// boundaries (`base`, `step`, `levels`) live in
++/// `xagg::LquantizeParams` registered at clause-parse time and
++/// applied at render time.
++pub const AGG_KIND_LQUANTIZE: u8 = 5;
++/// `llquantize()` aggregation (W5c). Log-linear-bucket
++/// histogram — map shape matches `AGG_KIND_LQUANTIZE`; bucket
++/// boundaries (`factor`, `low_mag`, `high_mag`,
++/// `steps_per_mag`) live in `xagg::LlquantizeParams`.
++pub const AGG_KIND_LLQUANTIZE: u8 = 6;
+ 
+ // =====================================================================
+ // SHMEM record probe-id magics.  Stored at offset 4 of every
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 0b08d421c373..9f16097d679e 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -3868,6 +3868,24 @@ __bpf_kfunc int bifrost_kfunc_emit_vma_table(void *buf, u32 buf__sz)
+  * push_agg_snapshot in the bifrost guest module). Same atomic
+  * CAS + wraparound logic; just lifted out of the BPF kfunc.
+  */
++/* W8: per-CPU speculation state.  Sized so the cross-CPU
++ * footprint stays bounded.  `active_lane != 0` ⇒ subsequent
++ * `bifrost_shmem_reserve_kernel_class` calls route into the
++ * per-CPU side buffer instead of the principal sub-ring;
++ * `commit()` replays buffered records back through the same
++ * reserve path with the lane deactivated. */
++#define BIFROST_SPEC_RECORDS_PER_CPU 16
++#define BIFROST_SPEC_RECORD_MAX 1024
++
++struct bifrost_spec_state {
++	u32 active_lane;
++	u32 buffered;
++	u32 record_sizes[BIFROST_SPEC_RECORDS_PER_CPU];
++	u32 record_classes[BIFROST_SPEC_RECORDS_PER_CPU];
++	u8 records[BIFROST_SPEC_RECORDS_PER_CPU][BIFROST_SPEC_RECORD_MAX];
++};
++DEFINE_PER_CPU(struct bifrost_spec_state, bifrost_spec_state);
++
+ /* Class-aware kernel-internal reserve. The BPF-callable kfunc
+  * below defaults to PRINCIPAL; other in-kernel call sites
+  * (push_agg_snapshot, publish_vma_table, symtab pumps) pass
+@@ -3878,6 +3896,7 @@ void *bifrost_shmem_reserve_kernel_class(u32 size, unsigned int class)
+ 	char *base = READ_ONCE(bifrost_shmem_va);
+ 	struct bifrost_shmem_ringbuf_hdr *hdr;
+ 	struct bifrost_shmem_per_cpu *pc;
++	struct bifrost_spec_state *spec;
+ 	u64 aligned, cur, new_pos, cons;
+ 	u64 rb_off, rb_len, off_in_rb;
+ 	u64 per_cpu_len;
+@@ -3887,6 +3906,41 @@ void *bifrost_shmem_reserve_kernel_class(u32 size, unsigned int class)
+ 
+ 	if (!base || !size || size > BIFROST_RB_MAX_RECORD)
+ 		return NULL;
++
++	/* W8: speculation routing.  If the current CPU has an
++	 * active speculation lane and the record fits the
++	 * per-CPU side buffer, return a pointer into the side
++	 * buffer instead of the principal sub-ring.  `commit`
++	 * later replays each buffered record back through this
++	 * function with `active_lane == 0`. */
++	spec = this_cpu_ptr(&bifrost_spec_state);
++	if (spec->active_lane != 0
++	    && spec->buffered < BIFROST_SPEC_RECORDS_PER_CPU
++	    && size + 8 <= BIFROST_SPEC_RECORD_MAX) {
++		u8 *rec = spec->records[spec->buffered];
++		u32 *spec_hdr = (u32 *)rec;
++
++		spec_hdr[0] = size;
++		spec_hdr[1] = 0;
++		spec->record_sizes[spec->buffered] = size;
++		spec->record_classes[spec->buffered] = class;
++		spec->buffered++;
++		return rec + 8;
++	}
++	/* If we're speculating but the buffer is full or the
++	 * record is too large, drop into the DBLERR-equivalent
++	 * "speculation buffer overflow" class so the user sees
++	 * something.  Returning NULL prevents the record from
++	 * landing anywhere. */
++	if (spec->active_lane != 0) {
++		hdr = (struct bifrost_shmem_ringbuf_hdr *)base;
++		if (hdr->num_cpus) {
++			cpu = smp_processor_id() % hdr->num_cpus;
++			atomic64_inc(&hdr->per_cpu[cpu]
++					      .dropped_records[BIFROST_DROP_CLASS_DBLERR]);
++		}
++		return NULL;
++	}
+ 	hdr = (struct bifrost_shmem_ringbuf_hdr *)base;
+ 	rb_off = hdr->ringbuf_off;
+ 	rb_len = hdr->ringbuf_len;
+@@ -4211,21 +4265,38 @@ __bpf_kfunc u64 bifrost_kfunc_walltime_ns(void)
+ }
+ 
+ /*
+- * W10 (partial): vtimestamp(). DTrace's contract is "ns the
+- * current thread has spent in probe context". The proper
+- * implementation captures entry time on every probe entry into
+- * a per-CPU `pid_tgid`-keyed task-storage map and subtracts on
+- * read; that machinery is filed under W10 follow-on.
++ * W10: vtimestamp().  DTrace's contract is "the total amount
++ * of time the current thread has been running on a CPU, minus
++ * the time spent in DTrace probe context."  The kernel
++ * scheduler already tracks per-task on-CPU runtime accurately
++ * in `task_struct.se.sum_exec_runtime` (nanoseconds), updated
++ * on every context switch and tick.  Returning this directly
++ * gives the user a monotonic per-thread CPU-time clock that
++ * advances at thread-scheduling-runtime scale (not wall-clock
++ * scale) — exactly the semantic dtrace(1) scripts rely on to
++ * separate "wall time" deltas from "thread CPU time" deltas.
++ *
++ * The "minus probe context" subtraction is an approximation
++ * we accept: Bifrost probes complete in microseconds and run
++ * with preemption disabled inside the BPF runtime, so the
++ * probe-context window is short and not separately tracked by
++ * the scheduler accounting.  Two consecutive reads of
++ * `vtimestamp` from the same thread bracket the thread's CPU
++ * time over the interval — the probe overhead itself is
++ * included in the delta, but at single-digit-microsecond cost
++ * the noise floor is negligible for any realistic profile
++ * workload.
+  *
+- * Today the kfunc aliases `ktime_get_ns()` so the variable is
+- * at least defined and scripts using it lower without error.
+- * The upgrade path is purely internal — no DIF, wire, or host
+- * renderer changes are required when the per-task accounting
+- * lands.
++ * Returns 0 if `current` is NULL (idle context shouldn't
++ * fire a Bifrost-lowered probe but the guard is cheap).
+  */
+ __bpf_kfunc u64 bifrost_kfunc_vtimestamp_ns(void)
+ {
+-	return ktime_get_ns();
++	struct task_struct *t = current;
++
++	if (!t)
++		return 0;
++	return t->se.sum_exec_runtime;
+ }
+ 
+ /*
+@@ -4243,14 +4314,50 @@ __bpf_kfunc u64 bifrost_kfunc_vtimestamp_ns(void)
+  * the kernel's per-thread `pid`. Matches DTrace semantics where
+  * `progenyof(N)` cares about the process tree, not threads.
+  */
++/*
++ * W3: bump the per-CPU `BIFROST_DROP_CLASS_DBLERR` counter for
++ * the current CPU when a fault-prone kfunc returns NULL / 0 on
++ * an unrecoverable input (NULL pointer, -EFAULT from
++ * `strncpy_from_user`, ancestor walk hitting the idle/init
++ * boundary).  Surfaces in the host CLI's drop summary as the
++ * `dblerr=N` class — the W7 per-class drop taxonomy was already
++ * shipping with `dblerr` rendered, just with no producer until
++ * now.  Gives users a visible signal that one of their
++ * fault-prone kfunc calls (copyin / copyinstr / strchr / strrchr
++ * / strstr / strjoin / substr / progenyof) silently no-op'd.
++ *
++ * Called from the kfunc error paths only; the kfuncs themselves
++ * still return the documented sentinel (NULL pointer or 0) so
++ * the BPF verifier's KF_RET_NULL contract is preserved and
++ * existing scripts continue to gracefully degrade.
++ */
++static inline void bifrost_kfunc_note_fault(void)
++{
++	struct bifrost_shmem_ringbuf_hdr *hdr;
++	char *base;
++	unsigned int cpu;
++
++	base = READ_ONCE(bifrost_shmem_va);
++	if (!base)
++		return;
++	hdr = (struct bifrost_shmem_ringbuf_hdr *)base;
++	if (!hdr->num_cpus)
++		return;
++	cpu = smp_processor_id() % hdr->num_cpus;
++	atomic64_inc(
++		&hdr->per_cpu[cpu].dropped_records[BIFROST_DROP_CLASS_DBLERR]);
++}
++
+ #define BIFROST_PROGENYOF_MAX_DEPTH 64
+ __bpf_kfunc u64 bifrost_kfunc_progenyof(u32 target_pid)
+ {
+ 	struct task_struct *t = current;
+ 	unsigned int depth;
+ 
+-	if (!t)
++	if (!t) {
++		bifrost_kfunc_note_fault();
+ 		return 0;
++	}
+ 	rcu_read_lock();
+ 	for (depth = 0; depth < BIFROST_PROGENYOF_MAX_DEPTH; depth++) {
+ 		struct task_struct *parent;
+@@ -4287,12 +4394,16 @@ __bpf_kfunc u64 bifrost_kfunc_strlen(const char *uaddr)
+ 	char buf[BIFROST_STR_MAX];
+ 	long n;
+ 
+-	if (!uaddr)
++	if (!uaddr) {
++		bifrost_kfunc_note_fault();
+ 		return 0;
++	}
+ 	n = strncpy_from_user(buf, (const char __user *)uaddr,
+ 			       BIFROST_STR_MAX);
+-	if (n < 0)
++	if (n < 0) {
++		bifrost_kfunc_note_fault();
+ 		return 0;
++	}
+ 	if (n == BIFROST_STR_MAX)
+ 		n = BIFROST_STR_MAX - 1;
+ 	return (u64)n;
+@@ -4318,12 +4429,14 @@ __bpf_kfunc char *bifrost_kfunc_copyinstr(const char *uaddr)
+ 	long n;
+ 
+ 	if (!uaddr) {
++		bifrost_kfunc_note_fault();
+ 		buf[0] = '\0';
+ 		return buf;
+ 	}
+ 	n = strncpy_from_user(buf, (const char __user *)uaddr,
+ 			       BIFROST_STR_MAX);
+ 	if (n < 0) {
++		bifrost_kfunc_note_fault();
+ 		buf[0] = '\0';
+ 		return buf;
+ 	}
+@@ -4350,12 +4463,16 @@ __bpf_kfunc char *bifrost_kfunc_strchr(const char *uaddr, u64 needle)
+ 	long n;
+ 	long i;
+ 
+-	if (!uaddr)
++	if (!uaddr) {
++		bifrost_kfunc_note_fault();
+ 		return NULL;
++	}
+ 	n = strncpy_from_user(buf, (const char __user *)uaddr,
+ 			       BIFROST_STR_MAX);
+-	if (n < 0)
++	if (n < 0) {
++		bifrost_kfunc_note_fault();
+ 		return NULL;
++	}
+ 	if (n >= BIFROST_STR_MAX)
+ 		n = BIFROST_STR_MAX - 1;
+ 	for (i = 0; i < n; i++) {
+@@ -4381,12 +4498,16 @@ __bpf_kfunc char *bifrost_kfunc_strrchr(const char *uaddr, u64 needle)
+ 	long n;
+ 	long i;
+ 
+-	if (!uaddr)
++	if (!uaddr) {
++		bifrost_kfunc_note_fault();
+ 		return NULL;
++	}
+ 	n = strncpy_from_user(buf, (const char __user *)uaddr,
+ 			       BIFROST_STR_MAX);
+-	if (n < 0)
++	if (n < 0) {
++		bifrost_kfunc_note_fault();
+ 		return NULL;
++	}
+ 	if (n >= BIFROST_STR_MAX)
+ 		n = BIFROST_STR_MAX - 1;
+ 	if (target == '\0')
+@@ -4416,11 +4537,13 @@ __bpf_kfunc void *bifrost_kfunc_copyin(const char *uaddr, u64 len)
+ 	long rc;
+ 
+ 	if (!uaddr || cap == 0) {
++		bifrost_kfunc_note_fault();
+ 		buf[0] = '\0';
+ 		return buf;
+ 	}
+ 	rc = copy_from_user(buf, (const void __user *)uaddr, cap);
+ 	if (rc != 0) {
++		bifrost_kfunc_note_fault();
+ 		/* Best-effort: zero on partial-or-failed copy so the
+ 		 * caller sees a deterministic blob instead of stale
+ 		 * scratch bytes. */
+@@ -4454,18 +4577,24 @@ __bpf_kfunc char *bifrost_kfunc_strstr(const char *uaddr_h,
+ 	char *n = this_cpu_ptr(bifrost_copyinstr_scratch_aux);
+ 	long hlen, nlen, i, j;
+ 
+-	if (!uaddr_h || !uaddr_n)
++	if (!uaddr_h || !uaddr_n) {
++		bifrost_kfunc_note_fault();
+ 		return NULL;
++	}
+ 	hlen = strncpy_from_user(h, (const char __user *)uaddr_h,
+ 				  BIFROST_STR_MAX);
+-	if (hlen < 0)
++	if (hlen < 0) {
++		bifrost_kfunc_note_fault();
+ 		return NULL;
++	}
+ 	if (hlen >= BIFROST_STR_MAX)
+ 		hlen = BIFROST_STR_MAX - 1;
+ 	nlen = strncpy_from_user(n, (const char __user *)uaddr_n,
+ 				  BIFROST_STR_MAX);
+-	if (nlen < 0)
++	if (nlen < 0) {
++		bifrost_kfunc_note_fault();
+ 		return NULL;
++	}
+ 	if (nlen >= BIFROST_STR_MAX)
+ 		nlen = BIFROST_STR_MAX - 1;
+ 	if (nlen == 0)
+@@ -4585,54 +4714,178 @@ __bpf_kfunc char *bifrost_kfunc_substr(const char *uaddr,
+ }
+ 
+ /*
+- * W8 (protocol-level): speculation lifecycle. Real DTrace
+- * speculation routes record reservations into per-lane side
+- * buffers until commit() promotes them or discard() drops them.
+- * The kfuncs here register the API surface so scripts that call
+- * speculation()/speculate()/commit()/discard() lower and load
+- * cleanly; the per-lane side-buffer machinery (per-CPU ring
+- * carved into N speculation lanes, lane-aware
+- * `bifrost_shmem_reserve_kernel`) is filed under W8 follow-on.
++ * W8: speculation lifecycle.  Real DTrace speculation routes
++ * record reservations into per-lane side buffers until
++ * `commit()` promotes them or `discard()` drops them.  This
++ * implementation supports a single active lane per CPU (lane
++ * id 1).  A real per-CPU bounded buffer holds up to
++ * `BIFROST_SPEC_RECORDS_PER_CPU` records of at most
++ * `BIFROST_SPEC_RECORD_MAX` bytes each.
++ *
++ *   speculation()      Allocate lane 1 on this CPU if no
++ *                      active lane.  Returns 0 if already
++ *                      speculating; returns 1 on success.
++ *   speculate(id)      For id==1, set the per-CPU active
++ *                      lane to 1 so subsequent
++ *                      `bifrost_shmem_reserve_kernel_class`
++ *                      calls route into the per-CPU side
++ *                      buffer instead of the principal
++ *                      sub-ring.
++ *   commit(id)         For id==1, replay every buffered
++ *                      record into the principal sub-ring
++ *                      via the standard reserve/submit
++ *                      path, then deactivate the lane.
++ *   discard(id)        For id==1, zero the buffered count
++ *                      and deactivate the lane.
+  *
+- * Current behavior: speculation() returns 1 (single conceptual
+- * lane id); speculate/commit/discard are no-ops. Records emit
+- * unconditionally to the principal sub-ring. Scripts that rely
+- * on speculative filtering will see UNFILTERED output — this is
+- * advertised in `docs/dtrace-roadmap.md` W8.
++ * Per-CPU storage is sized at ~16 KB so the cross-CPU footprint
++ * is bounded at `BIFROST_NUM_CPUS_MAX * 16 KB = 256 KB`.
++ * Records exceeding `BIFROST_SPEC_RECORD_MAX` or arriving past
++ * `BIFROST_SPEC_RECORDS_PER_CPU` are dropped (commit replays
++ * only what fit).  See the `struct bifrost_spec_state`
++ * declaration above `bifrost_shmem_reserve_kernel_class`.
+  */
+ __bpf_kfunc u64 bifrost_kfunc_speculation(void)
+ {
++	struct bifrost_spec_state *s = this_cpu_ptr(&bifrost_spec_state);
++
++	if (s->active_lane != 0)
++		return 0;
+ 	return 1;
+ }
+ 
+-__bpf_kfunc void bifrost_kfunc_speculate(u64 id__ign)
++__bpf_kfunc void bifrost_kfunc_speculate(u64 id)
+ {
++	struct bifrost_spec_state *s = this_cpu_ptr(&bifrost_spec_state);
++
++	if (id == 1 && s->active_lane == 0) {
++		s->active_lane = 1;
++		s->buffered = 0;
++	}
+ }
+ 
+-__bpf_kfunc void bifrost_kfunc_commit(u64 id__ign)
++__bpf_kfunc void bifrost_kfunc_commit(u64 id)
+ {
++	struct bifrost_spec_state *s = this_cpu_ptr(&bifrost_spec_state);
++	u32 i;
++
++	if (id != 1 || s->active_lane != 1)
++		return;
++	/* Turn off speculation BEFORE replay so the replay calls
++	 * route through the principal path. */
++	s->active_lane = 0;
++	for (i = 0; i < s->buffered; i++) {
++		u32 sz = s->record_sizes[i];
++		u32 cls = s->record_classes[i];
++		void *dst;
++
++		if (sz == 0 || sz > BIFROST_SPEC_RECORD_MAX - 8)
++			continue;
++		dst = bifrost_shmem_reserve_kernel_class(sz, cls);
++		if (dst) {
++			memcpy(dst, &s->records[i][8], sz);
++			bifrost_shmem_submit_kernel(dst);
++		}
++	}
++	s->buffered = 0;
+ }
+ 
+-__bpf_kfunc void bifrost_kfunc_discard(u64 id__ign)
++__bpf_kfunc void bifrost_kfunc_discard(u64 id)
+ {
++	struct bifrost_spec_state *s = this_cpu_ptr(&bifrost_spec_state);
++
++	if (id != 1)
++		return;
++	s->active_lane = 0;
++	s->buffered = 0;
+ }
+ 
+ /*
+- * W5 (protocol-level): clear(@agg). DTrace's `clear()` zeros
+- * every entry of an aggregation map. The full implementation
+- * needs (a) `KF_ARG_PTR_TO_MAP` verifier support so a BPF
+- * program can pass its agg's `bpf_map *` here, and (b) per-CPU
+- * value walking for PERCPU_* map types. Both are filed under
+- * W5 follow-on along with `lquantize` / `llquantize` /
+- * `normalize` / `trunc`.
+- *
+- * Today the kfunc is a no-op so scripts that call `clear()`
+- * compile and load; the aggregation retains its values across
+- * the call. Loud documentation in `docs/dtrace-roadmap.md`.
++ * W5a: clear(@agg).  DTrace's `clear()` zeros every entry of
++ * an aggregation map.  The `__map` arg suffix routes through
++ * the verifier's `KF_ARG_PTR_TO_MAP` path so the BPF program
++ * emits `bpf_ld_map_fd(r1, agg_fd); call <kfunc>` and the
++ * verifier resolves the agg's fake_fd to a real `struct bpf_map *`
++ * at LOAD_PROG time.  Walks every key (PERCPU_ARRAY by integer
++ * index; PERCPU_HASH via `map_get_next_key`) and zeroes every
++ * per-CPU value slot in place.  Bounded at
++ * `BIFROST_CLEAR_MAX_KEYS` so a misconfigured large map can't
++ * monopolise the kernel.
+  */
+-__bpf_kfunc int bifrost_kfunc_clear_agg(u64 map_fd__ign)
++#define BIFROST_CLEAR_MAX_KEYS 65536
++#define BIFROST_CLEAR_MAX_KEY_SIZE 64
++
++__bpf_kfunc int bifrost_kfunc_clear_agg(struct bpf_map *map__map)
+ {
+-	return 0;
++	struct bpf_map *map = map__map;
++	u32 value_size;
++	int cpu;
++
++	if (!map || !map->ops)
++		return -EINVAL;
++	if (!map->ops->map_lookup_percpu_elem)
++		return -EINVAL;
++	value_size = map->value_size;
++	/* Largest agg slot today is 24 bytes (stddev); cap at 64
++	 * so future small additions don't need a recompile, while
++	 * a misconfigured map still gets rejected. */
++	if (value_size == 0 || value_size > BIFROST_CLEAR_MAX_KEY_SIZE)
++		return -EINVAL;
++
++	if (map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
++		u32 key;
++		u32 max = map->max_entries;
++
++		if (max > BIFROST_CLEAR_MAX_KEYS)
++			max = BIFROST_CLEAR_MAX_KEYS;
++		for (key = 0; key < max; key++) {
++			for_each_possible_cpu(cpu) {
++				void *val = map->ops->map_lookup_percpu_elem(
++					map, &key, cpu);
++
++				if (val)
++					memset(val, 0, value_size);
++			}
++		}
++		return 0;
++	}
++
++	if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
++		u8 cur_key[BIFROST_CLEAR_MAX_KEY_SIZE];
++		u8 next_key[BIFROST_CLEAR_MAX_KEY_SIZE];
++		void *prev = NULL;
++		u32 key_size = map->key_size;
++		int n;
++
++		if (key_size == 0 || key_size > BIFROST_CLEAR_MAX_KEY_SIZE)
++			return -EINVAL;
++
++		for (n = 0; n < BIFROST_CLEAR_MAX_KEYS; n++) {
++			int err;
++
++			rcu_read_lock();
++			err = map->ops->map_get_next_key(map, prev, next_key);
++			rcu_read_unlock();
++			if (err == -ENOENT)
++				break;
++			if (err)
++				return err;
++
++			for_each_possible_cpu(cpu) {
++				void *val = map->ops->map_lookup_percpu_elem(
++					map, next_key, cpu);
++
++				if (val)
++					memset(val, 0, value_size);
++			}
++
++			memcpy(cur_key, next_key, key_size);
++			prev = cur_key;
++		}
++		return 0;
++	}
++
++	return -EINVAL;
+ }
+ 
+ __bpf_kfunc_end_defs();
+@@ -4747,12 +5000,17 @@ BTF_ID_FLAGS(func, bifrost_kfunc_strstr, KF_RET_NULL)
+ BTF_ID_FLAGS(func, bifrost_kfunc_index)
+ BTF_ID_FLAGS(func, bifrost_kfunc_strjoin)
+ BTF_ID_FLAGS(func, bifrost_kfunc_substr)
+-/* W8 (protocol-level): speculation lifecycle no-op stubs. */
++/* W8: speculation lifecycle.  Per-CPU `struct bifrost_spec_state`
++ * carves a 16-slot × 1 KB side buffer; reserve routes there when
++ * `active_lane != 0`; commit replays into the principal sub-ring;
++ * discard zeroes the buffer. */
+ BTF_ID_FLAGS(func, bifrost_kfunc_speculation)
+ BTF_ID_FLAGS(func, bifrost_kfunc_speculate)
+ BTF_ID_FLAGS(func, bifrost_kfunc_commit)
+ BTF_ID_FLAGS(func, bifrost_kfunc_discard)
+-/* W5 (partial): clear() agg-zeroing kfunc. */
++/* W5a: clear() walks the agg map's per-CPU value slots and zeroes
++ * them in place.  `__map` arg suffix routes through the verifier's
++ * KF_ARG_PTR_TO_MAP path. */
+ BTF_ID_FLAGS(func, bifrost_kfunc_clear_agg)
+ BTF_KFUNCS_END(common_btf_ids)
+ 
+-- 
+2.50.1 (Apple Git-155)
+

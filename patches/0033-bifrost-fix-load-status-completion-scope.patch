@@ -1,0 +1,36 @@
+From a1e5be2768b38dc1d6f59d924b01630713b44422 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Mon, 11 May 2026 19:23:17 -0700
+Subject: [PATCH] bifrost: fix load status completion scope
+
+---
+ drivers/bifrost/bifrost.rs | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index f833a3e8555f..36c08a5e5b4d 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -1606,13 +1606,13 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+             // RINGBUF_RECORDS) is gone — kept as #[allow(dead_code)]
+             // scaffolding pending the agg-path SHMEM port.
+ 
+-            if core::ptr::read_volatile(&(*bg).pending_work) != 0 {
+-                core::ptr::write_volatile(&mut (*bg).pending_work, 0);
++	            if core::ptr::read_volatile(&(*bg).pending_work) != 0 {
++	                core::ptr::write_volatile(&mut (*bg).pending_work, 0);
+ 
+-                let cmd = (*bg).ctrl_buf as *mut BifrostCmd;
+-                if (*bg).cmd_len >= core::mem::size_of::<BifrostCmd>() as u32 {
+-                    let mut load_status: i32 = 0;
+-                    if (*cmd).op == 2 { // LOAD_PROG
++	                let cmd = (*bg).ctrl_buf as *mut BifrostCmd;
++	                let mut load_status: i32 = 0;
++	                if (*bg).cmd_len >= core::mem::size_of::<BifrostCmd>() as u32 {
++	                    if (*cmd).op == 2 { // LOAD_PROG
+                         pr_info!("bifrost_guest: processing LOAD_PROG command\n");
+                         let parse_status = validate_load_prog_cmd(cmd, (*bg).cmd_len);
+                         if parse_status != 0 {
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,171 @@
+From 5e6115c23678604172d8fd58af4aa34c333ad2e1 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Mon, 11 May 2026 19:06:26 -0700
+Subject: [PATCH] bifrost: report load status to host
+
+---
+ drivers/bifrost/bifrost.rs | 86 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 77 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/bifrost/bifrost.rs b/drivers/bifrost/bifrost.rs
+index f10fdd14cb9c..f833a3e8555f 100644
+--- a/drivers/bifrost/bifrost.rs
++++ b/drivers/bifrost/bifrost.rs
+@@ -1148,14 +1148,72 @@ unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
+ }
+ 
+ 
+-unsafe fn repost_ctrl_status(bg: *mut BifrostGuest, status: i32) {
++unsafe fn load_prog_seq(cmd: *const BifrostCmd, cmd_len: u32) -> u64 {
+     unsafe {
++        if cmd.is_null() || (cmd_len as usize) < core::mem::size_of::<BifrostCmd>() {
++            return 0;
++        }
++        let seq_off = core::mem::size_of::<BifrostCmd>() + (*cmd).len as usize;
++        if (cmd_len as usize) < seq_off + core::mem::size_of::<u64>() {
++            return 0;
++        }
++        core::ptr::read_unaligned((cmd as *const u8).add(seq_off) as *const u64)
++    }
++}
++
++unsafe fn send_load_prog_status(bg: *mut BifrostGuest, seq: u64, status: i32) {
++    unsafe {
++        const OP_LOAD_PROG_STATUS: u32 = 9;
++        let event_buf = (*bg).event_buf as *mut u8;
++        core::ptr::copy_nonoverlapping(
++            &OP_LOAD_PROG_STATUS as *const u32 as *const u8,
++            event_buf,
++            4,
++        );
++        core::ptr::copy_nonoverlapping(
++            &seq as *const u64 as *const u8,
++            event_buf.add(4),
++            8,
++        );
+         core::ptr::copy_nonoverlapping(
+             &status as *const i32 as *const u8,
+-            (*bg).ctrl_buf as *mut u8,
++            event_buf.add(12),
+             4,
+         );
+ 
++        let mut sg: bindings::scatterlist = core::mem::zeroed();
++        bindings::sg_init_one(&mut sg, (*bg).event_buf, 16);
++        let add_err = bindings::virtqueue_add_outbuf(
++            (*bg).vq_event,
++            &mut sg,
++            1,
++            (*bg).event_buf,
++            bindings::GFP_KERNEL,
++        );
++        if add_err != 0 {
++            pr_err!("bifrost_guest: LOAD_PROG status event add failed: {}\n", add_err);
++            return;
++        }
++        bindings::virtqueue_kick((*bg).vq_event);
++
++        let mut consumed_len: core::ffi::c_uint = 0;
++        let mut spins: u32 = 0;
++        loop {
++            let ret = bindings::virtqueue_get_buf((*bg).vq_event, &mut consumed_len);
++            if !ret.is_null() {
++                break;
++            }
++            core::hint::spin_loop();
++            spins += 1;
++            if spins % 1024 == 0 {
++                bindings::__cond_resched();
++            }
++        }
++    }
++}
++
++unsafe fn repost_ctrl_buffer(bg: *mut BifrostGuest) {
++    unsafe {
+         let mut sg_in: bindings::scatterlist = core::mem::zeroed();
+         bindings::sg_init_one(&mut sg_in, (*bg).ctrl_buf, 65536);
+         bindings::virtqueue_add_inbuf(
+@@ -1169,6 +1227,16 @@ unsafe fn repost_ctrl_status(bg: *mut BifrostGuest, status: i32) {
+     }
+ }
+ 
++unsafe fn complete_load_prog(bg: *mut BifrostGuest, cmd: *const BifrostCmd, status: i32) {
++    unsafe {
++        if !cmd.is_null() && (*cmd).op == 2 {
++            let seq = load_prog_seq(cmd, (*bg).cmd_len);
++            send_load_prog_status(bg, seq, status);
++        }
++        repost_ctrl_buffer(bg);
++    }
++}
++
+ unsafe fn free_slot_prog(slot: usize) {
+     unsafe {
+         if slot >= slots_mut().len() {
+@@ -1552,7 +1620,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                 "bifrost_guest: LOAD_PROG rejected by bounded parser: {}\n",
+                                 parse_status
+                             );
+-                            repost_ctrl_status(bg, parse_status);
++                            complete_load_prog(bg, cmd, parse_status);
+                             continue;
+                         }
+                         
+@@ -1745,7 +1813,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                             // Skip processing this command; re-post and
+                             // continue.  Falling through with bad lengths
+                             // would corrupt the maps/insns offsets.
+-                            repost_ctrl_status(bg, -(bindings::EINVAL as i32));
++                            complete_load_prog(bg, cmd, -(bindings::EINVAL as i32));
+                             continue;
+                         }
+ 
+@@ -1834,7 +1902,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+ 	                            // verifier of THIS program (we close them after).
+ 	                        }
+                         if load_status != 0 {
+-                            repost_ctrl_status(bg, load_status);
++                            complete_load_prog(bg, cmd, load_status);
+                             continue;
+                         }
+ 	                        // --- Phase 1b: per-program real-fd allocation. ---
+@@ -2077,7 +2145,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                     BIFROST_MAP_REAL_FDS[j] = -1;
+                                 }
+                             }
+-                            repost_ctrl_status(bg, -(bindings::EINVAL as i32));
++                            complete_load_prog(bg, cmd, -(bindings::EINVAL as i32));
+                             continue;
+                         }
+                         if num_relocs > 0 {
+@@ -2104,7 +2172,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                 e
+                             );
+                             // Re-arm and continue without registering anything.
+-                            repost_ctrl_status(bg, -(bindings::ENOMEM as i32));
++                            complete_load_prog(bg, cmd, -(bindings::ENOMEM as i32));
+                             continue;
+                         }
+ 
+@@ -2246,7 +2314,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                                             BIFROST_MAP_REAL_FDS[j] = -1;
+                                         }
+                                     }
+-                                    repost_ctrl_status(bg, verr);
++                                    complete_load_prog(bg, cmd, verr);
+                                     continue;
+                                 }
+                                 pr_info!("bifrost_guest: bifrost_verify_prog ok\n");
+@@ -2338,7 +2406,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
+                 }
+ 
+                 // Re-post ctrl buffer for next command
+-                repost_ctrl_status(bg, load_status);
++                complete_load_prog(bg, cmd, load_status);
+             } else {
+                 bindings::schedule_timeout_interruptible(10);
+             }
+-- 
+2.50.1 (Apple Git-155)
+

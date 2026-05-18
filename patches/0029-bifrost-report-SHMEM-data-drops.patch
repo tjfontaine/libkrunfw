@@ -1,0 +1,222 @@
+From f70ae0e3ccb4f3f95fb3e70f338fbe6a246226b2 Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Mon, 11 May 2026 16:58:57 -0700
+Subject: [PATCH] bifrost: report SHMEM data drops
+
+---
+ drivers/bifrost/shmem_layout.rs |  2 +-
+ drivers/bifrost/wire.rs         |  4 +-
+ kernel/bpf/helpers.c            | 90 +++++++++++++++++++--------------
+ 3 files changed, 55 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/bifrost/shmem_layout.rs b/drivers/bifrost/shmem_layout.rs
+index 3bef87230264..00de89cfccfb 100644
+--- a/drivers/bifrost/shmem_layout.rs
++++ b/drivers/bifrost/shmem_layout.rs
+@@ -24,7 +24,7 @@
+ pub(crate) const SHMEM_MAGIC: u32 = 0x48534642;
+ /// Layout version stored next to the magic. Bumped whenever the
+ /// header layout changes incompatibly.
+-pub(crate) const SHMEM_VERSION: u32 = 2;
++pub(crate) const SHMEM_VERSION: u32 = 3;
+ 
+ /// Phase 3a SHMEM sub-region layout (offsets within the 16 MB
+ /// region, all 4 KB aligned). Kept in sync with the host's
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index 2a55ba446b9c..a1fa11ed2ab6 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: 5b8fc1ac9886a9d540f024de2e27f9bf185c9193667f06e91f6c1a968fd534c9
++// CANONICAL_SHA256: 9f8779b23cebea9ea83daae30d07c1ba076508587b683056bbc02dea9fa9d78b
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -625,7 +625,7 @@
+ pub const SHMEM_MAGIC: u32 = 0x48534642;
+ /// Layout version stored next to `SHMEM_MAGIC`. Bump when the SHMEM
+ /// header layout changes incompatibly.
+-pub const SHMEM_VERSION: u32 = 2;
++pub const SHMEM_VERSION: u32 = 3;
+ /// 8-byte record header: u32 size, u32 flags.
+ pub const SHMEM_RECORD_HDR_SIZE: usize = 8;
+ pub const SHMEM_RECORD_FLAG_READY: u32 = 1;
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index ad9b86576a96..013282a2a109 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -2365,12 +2365,14 @@ EXPORT_SYMBOL_GPL(bifrost_free_shmem);
+  *
+  * Header layout (matches host's `ShmemRingbufHdr`):
+  *   +0   u32 magic   ('BFSH', stamped at probe time)
+- *   +4   u32 version (1)
++ *   +4   u32 version
+  *   +8   u64 region_len
+  *   +16  u64 ringbuf_off       (data area start — typically 4 KB)
+  *   +24  u64 ringbuf_len       (data area length, multiple of 8)
+  *   +32  u64 producer_pos      (monotonic; offset into data = pos % len)
+  *   +40  u64 consumer_pos
++ *   +96  u64 dropped_records   (reserve failures after SHMEM is live)
++ *   +104 u64 dropped_bytes     (payload bytes refused by reserve)
+  *
+  * Record format (8-byte aligned):
+  *   +0   u32 size               (payload bytes; 0 unused for now)
+@@ -2405,6 +2407,8 @@ struct bifrost_shmem_ringbuf_hdr {
+ 	/* Phase 3b reserved (per-(tgid,exec_id) VMA cache). */
+ 	u64 vma_cache_off;
+ 	u64 vma_cache_len;
++	atomic64_t dropped_records;
++	atomic64_t dropped_bytes;
+ };
+ 
+ #define BIFROST_RB_FLAG_READY     (1u << 0)
+@@ -2418,6 +2422,13 @@ struct bifrost_shmem_ringbuf_hdr {
+ static char *bifrost_shmem_va __read_mostly;
+ static unsigned long bifrost_shmem_len __read_mostly;
+ 
++static void bifrost_shmem_note_drop(struct bifrost_shmem_ringbuf_hdr *hdr,
++				    u32 size)
++{
++	atomic64_inc(&hdr->dropped_records);
++	atomic64_add(size, &hdr->dropped_bytes);
++}
++
+ /*
+  * Called by the bifrost guest module after the SHMEM region is
+  * allocated and the host has acked SHMEM_INIT. Initializes the
+@@ -2459,6 +2470,8 @@ int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
+ 	hdr->vma_cache_len = vma_cache_len;
+ 	atomic64_set(&hdr->producer_pos, 0);
+ 	atomic64_set(&hdr->consumer_pos, 0);
++	atomic64_set(&hdr->dropped_records, 0);
++	atomic64_set(&hdr->dropped_bytes, 0);
+ 	smp_wmb();
+ 
+ 	WRITE_ONCE(bifrost_shmem_va, (char *)shmem_va);
+@@ -3777,8 +3790,10 @@ void *bifrost_shmem_reserve_kernel(u32 size)
+ 		 * units. */
+ 		if (off_in_rb + aligned > rb_len) {
+ 			u64 pad_size = rb_len - off_in_rb;
+-			if (cur + pad_size - cons > rb_len)
++			if (cur + pad_size - cons > rb_len) {
++				bifrost_shmem_note_drop(hdr, size);
+ 				return NULL; /* padding would lap consumer */
++			}
+ 			new_pos = cur + pad_size;
+ 			if (atomic64_cmpxchg(&hdr->producer_pos, cur,
+ 					     new_pos) != cur) {
+@@ -3795,8 +3810,10 @@ void *bifrost_shmem_reserve_kernel(u32 size)
+ 			continue;
+ 		}
+ 
+-		if (cur + aligned - cons > rb_len)
++		if (cur + aligned - cons > rb_len) {
++			bifrost_shmem_note_drop(hdr, size);
+ 			return NULL;
++		}
+ 		new_pos = cur + aligned;
+ 		if (atomic64_cmpxchg(&hdr->producer_pos, cur, new_pos) == cur)
+ 			break;
+@@ -3915,6 +3932,30 @@ static bool bifrost_vma_pub_test_and_set(u32 tgid, u32 exec_id)
+ 	return already_seen;
+ }
+ 
++static void bifrost_vma_pub_clear(u32 tgid, u32 exec_id)
++{
++	u64 key = ((u64)tgid << 32) | exec_id;
++	u32 idx, i;
++	unsigned long flags;
++
++	if (key == 0)
++		key = 1;
++	idx = hash_64(key, 12) & (BIFROST_VMA_PUB_BUCKETS - 1);
++
++	spin_lock_irqsave(&bifrost_vma_pub_lock, flags);
++	for (i = 0; i < BIFROST_VMA_PUB_PROBE_DEPTH; i++) {
++		u32 slot = (idx + i) & (BIFROST_VMA_PUB_BUCKETS - 1);
++
++		if (bifrost_vma_pub_table[slot].key == key) {
++			bifrost_vma_pub_table[slot].key = 0;
++			break;
++		}
++		if (bifrost_vma_pub_table[slot].key == 0)
++			break;
++	}
++	spin_unlock_irqrestore(&bifrost_vma_pub_lock, flags);
++}
++
+ /*
+  * Phase 4 doorbell. The bifrost guest module publishes a
+  * `void (*kick_doorbell)(void *priv)` callback + private cookie
+@@ -3973,11 +4014,7 @@ __bpf_kfunc int bifrost_kfunc_publish_vma_table(void)
+ 	u64 pid_tgid;
+ 	u32 tgid, exec_id;
+ 	char *base;
+-	struct bifrost_shmem_ringbuf_hdr *hdr;
+-	u64 aligned, cur, new_pos, cons;
+-	u64 rb_off, rb_len, off_in_rb;
+-	u32 *rec_hdr;
+-	u8 *data, *rec, *body;
++	u8 *rec, *body;
+ 	int written;
+ 
+ 	if (!task || (task->flags & PF_KTHREAD))
+@@ -3986,38 +4023,16 @@ __bpf_kfunc int bifrost_kfunc_publish_vma_table(void)
+ 	tgid = task->tgid;
+ 	exec_id = task->self_exec_id;
+ 
+-	if (bifrost_vma_pub_test_and_set(tgid, exec_id))
+-		return 0; /* already published */
+-
+ 	base = READ_ONCE(bifrost_shmem_va);
+ 	if (!base)
+ 		return -ENOENT;
+-	hdr = (struct bifrost_shmem_ringbuf_hdr *)base;
+-	rb_off = hdr->ringbuf_off;
+-	rb_len = hdr->ringbuf_len;
+-	if (!rb_len)
+-		return -ENOENT;
+-	data = (u8 *)base + rb_off;
+-	aligned = ALIGN(BIFROST_RB_RECORD_HDR + BIFROST_VMA_REC_SIZE, 8);
+-
+-	for (;;) {
+-		cur = atomic64_read(&hdr->producer_pos);
+-		cons = atomic64_read(&hdr->consumer_pos);
+-		off_in_rb = cur % rb_len;
+-		if (off_in_rb + aligned > rb_len)
+-			return -ENOSPC;
+-		if (cur + aligned - cons > rb_len)
+-			return -ENOSPC;
+-		new_pos = cur + aligned;
+-		if (atomic64_cmpxchg(&hdr->producer_pos, cur, new_pos) == cur)
+-			break;
+-		cpu_relax();
++	if (bifrost_vma_pub_test_and_set(tgid, exec_id))
++		return 0; /* already published */
++	rec = bifrost_shmem_reserve_kernel(BIFROST_VMA_REC_SIZE);
++	if (!rec) {
++		bifrost_vma_pub_clear(tgid, exec_id);
++		return -ENOSPC;
+ 	}
+-
+-	rec_hdr = (u32 *)(data + off_in_rb);
+-	rec_hdr[0] = BIFROST_VMA_REC_SIZE;
+-	WRITE_ONCE(rec_hdr[1], 0); /* busy */
+-	rec = (u8 *)rec_hdr + BIFROST_RB_RECORD_HDR;
+ 	/* Correlation header. */
+ 	*(u32 *)(rec + 0) = 0;                                /* vmid */
+ 	*(u32 *)(rec + 4) = BIFROST_VMA_PUB_PROBE_MAGIC;       /* probe_id */
+@@ -4032,8 +4047,7 @@ __bpf_kfunc int bifrost_kfunc_publish_vma_table(void)
+ 		 * host doesn't choke on stale memory. */
+ 		memset(body, 0, BIFROST_VMA_REC_BODY_SIZE);
+ 	}
+-	/* Publish. */
+-	smp_store_release(&rec_hdr[1], BIFROST_RB_FLAG_READY);
++	bifrost_shmem_submit_kernel(rec);
+ 	return 1;
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

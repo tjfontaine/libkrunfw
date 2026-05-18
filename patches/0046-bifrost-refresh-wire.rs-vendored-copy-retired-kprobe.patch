@@ -1,0 +1,61 @@
+From 710853e21603befd65a9378fe6b3b2c65655187c Mon Sep 17 00:00:00 2001
+From: Timothy J Fontaine <tjfontaine@atxconsulting.com>
+Date: Fri, 15 May 2026 07:24:30 -0700
+Subject: [PATCH] bifrost: refresh wire.rs vendored copy + retired-kprobe
+ comment
+
+Re-vendor from host/bifrost-wire/src/lib.rs to pick up the clarified
+"retired kprobe slot" comment. The wire-format codec still decodes
+probe_type 0/1 with an empty trailer (for the canonical minimal
+wrapper golden); the comment now spells that out as decode-only
+compatibility rather than implying the slots are gone everywhere.
+
+CANONICAL_SHA256 pin updated; scripts/check-proto-drift.sh passes.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/bifrost/wire.rs | 23 ++++++++++++++++-------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/bifrost/wire.rs b/drivers/bifrost/wire.rs
+index 45e2b1d2a6ee..2886f8bdb1ab 100644
+--- a/drivers/bifrost/wire.rs
++++ b/drivers/bifrost/wire.rs
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+-// CANONICAL_SHA256: f565fc5b5adac79d7882abd84eab80f94304e651b3a4878267b3303ba2d3babf
++// CANONICAL_SHA256: a236d7ac9cc1ec9475f038b8466b721e22dab4b6e2caa76c11128aedadd42b34
+ // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
+ //
+ // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
+@@ -87,12 +87,21 @@
+ /// allocated but never registered.  No live probe ever takes this
+ /// value.
+ pub const PROBE_TYPE_NONE: u8 = 0xff;
+-// PROBE_TYPE_KPROBE (0) and PROBE_TYPE_KRETPROBE (1) retired:
+-// kprobe int3 attach is no longer the canonical kernel-function
+-// probe shape in bifrost — fbt (FENTRY/FEXIT trampoline) covers
+-// regular functions and tracepoints (PROBE_TYPE_TRACEPOINT)
+-// reach the notrace-marked targets that kprobe used to.  The
+-// wire-format slots 0/1 are gone with the dispatch arms.
++// PROBE_TYPE_KPROBE (0) and PROBE_TYPE_KRETPROBE (1) retired from
++// the kernel-side dispatch: kprobe int3 attach is no longer the
++// canonical kernel-function probe shape in bifrost — fbt
++// (FENTRY/FEXIT trampoline) covers regular functions and
++// tracepoints (PROBE_TYPE_TRACEPOINT) reach the notrace-marked
++// targets that kprobe used to.
++//
++// Wire-format compatibility: the codec in `codec.rs` and the
++// `wrapper_golden.rs` test fixtures still accept probe_type 0/1
++// with an empty trailer. This is *decode-only compatibility* so
++// older recorded BFR7 wrappers (and the canonical minimal golden)
++// remain parseable; no live host path produces a 0/1 wrapper and
++// the kernel has no dispatch arm for them. Treat 0/1 the same way
++// you would treat any retired-but-grandfathered enum value: do
++// not introduce new producers.
+ pub const PROBE_TYPE_UPROBE: u8 = 2;
+ pub const PROBE_TYPE_URETPROBE: u8 = 3;
+ /// Kernel-resolved uprobes: the host CLI sends just (basename,
+-- 
+2.50.1 (Apple Git-155)
+
