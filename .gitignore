@@ -6,3 +6,6 @@ kernel.c
 vmlinux
 /tarballs
 /linux-*
+
+libkrunfw.5.dylib
+.libkrunfw-builder.provisioned
